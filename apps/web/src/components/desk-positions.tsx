@@ -86,6 +86,8 @@ export function DeskPositions() {
 
   useEffect(() => {
     refreshData();
+    const interval = setInterval(refreshData, 10000);
+    return () => clearInterval(interval);
   }, [refreshData]);
 
   async function handleClosePosition(symbol: string) {
@@ -160,7 +162,7 @@ export function DeskPositions() {
         <StateCard
           title="BROKER RECONCILIATION"
           value={state.broker.state}
-          detail="Freshness verified · In parity"
+          detail="Freshness verified · Live 10s sync"
           tone={state.broker.state === "RECONCILED" ? "good" : "warn"}
         />
       </div>
@@ -183,7 +185,7 @@ export function DeskPositions() {
           <small>PORTFOLIO EXPOSURE</small>
           <h2>Open Option Contracts & Positions</h2>
         </div>
-        <span className="status-pill good">ALL EXPOSURE RECONCILED</span>
+        <span className="status-pill good">ALL EXPOSURE RECONCILED · LIVE 10S</span>
       </div>
 
       <section className="data-table">
