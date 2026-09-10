@@ -187,6 +187,9 @@ export function DeskPositions() {
         </div>
         <span className="status-pill good">ALL EXPOSURE RECONCILED · LIVE 10S</span>
       </div>
+      <p style={{ fontSize: "12px", color: "#5a6864", margin: "4px 0 14px 0" }}>
+        Market hours for U.S. options are <strong>9:30 AM – 4:00 PM Eastern Time</strong>. Closing market orders execute during regular trading hours.
+      </p>
 
       <section className="data-table">
         <header style={{ gridTemplateColumns: "1.4fr 1.2fr .8fr 1fr 1fr .8fr 1.1fr" }}>
@@ -317,6 +320,7 @@ export function DeskPositions() {
         {state.orders.length ? (
           state.orders.map((o) => {
             const isFilled = o.status === "filled";
+            const opt = o.symbol ? parseOptionSymbol(o.symbol) : null;
             return (
               <div
                 className="data-row"
@@ -335,10 +339,15 @@ export function DeskPositions() {
                     ? `${o.client_order_id.slice(0, 16)}…`
                     : o.client_order_id}
                 </code>
-                <strong>{o.symbol ?? "MULTI-LEG"}</strong>
+                <div>
+                  <strong>{opt?.isOption ? `${opt.root} $${opt.strike} ${opt.type}` : (o.symbol ?? "MULTI-LEG")}</strong>
+                  {opt?.isOption ? (
+                    <small style={{ color: "#707d79", fontSize: "9px", display: "block" }}>{o.symbol}</small>
+                  ) : null}
+                </div>
                 <code style={{ fontSize: "10px" }}>{o.broker_order_id.slice(0, 12)}…</code>
                 <span>
-                  {o.filled_quantity} / {o.quantity}
+                  {o.filled_quantity ?? "0"} / {o.quantity ?? "1"}
                 </span>
                 <span>{o.time_in_force ?? "DAY"}</span>
                 <span className={`status-pill ${isFilled ? "good" : ""}`}>

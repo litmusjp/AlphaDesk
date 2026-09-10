@@ -157,7 +157,7 @@ class AlpacaPaperBrokerAdapter:
         return tuple(self._map_position(position) for position in raw)
 
     async def list_open_orders(self) -> tuple[BrokerOrder, ...]:
-        request = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=True)
+        request = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=50, nested=True)
         raw = await asyncio.to_thread(self._client.get_orders, request)
         return tuple(self._map_order(order) for order in raw)
 

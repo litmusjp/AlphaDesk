@@ -16,6 +16,7 @@ from packages.ai.provider import OpenRouterProvider
 from packages.ai.store import AIWorkflowStore
 from packages.ai.workflow import AIWorkflow
 from packages.auth.dependencies import WorkspaceContext, require_workspace
+from alpaca.common.exceptions import APIError
 from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.broker.reconciliation import BrokerExecutionGate
@@ -810,8 +811,15 @@ async def close_position(
         order = await adapter.close_position(symbol_or_asset_id)
         projections = _broker_store(request, context)
         snapshot = await adapter.reconcile()
-        await projections.save_snapshot(snapshot)
+        await projections.apply_reconciliation(snapshot)
         return order
+    except APIError as error:
+        detail = str(error)
+        if "market orders are only allowed during market hours" in detail:
+            detail = "Options market orders can only be executed during regular market hours (9:30 AM – 4:00 PM EDT). Please try again when the market opens."
+        elif "position not found" in detail:
+            detail = f"Position {symbol_or_asset_id} is already closed or does not exist on the broker."
+        raise HTTPException(status_code=400, detail=detail) from error
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     finally:
