@@ -40,8 +40,8 @@ async def create_demo_session(request: Request, response: Response) -> DemoSessi
         token,
         max_age=24 * 60 * 60,
         httponly=True,
-        secure=request.url.scheme == "https",
-        samesite="lax",
+        secure=True,
+        samesite="none",
         path="/",
     )
     return DemoSessionStatus(

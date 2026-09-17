@@ -4,6 +4,7 @@ import asyncio
 import json
 from typing import Any, Protocol, TypeVar, cast
 
+from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
@@ -176,3 +177,56 @@ class OpenRouterProvider:
         if not content:
             raise ValueError(f"{agent_name} returned no structured output")
         return response_model.model_validate(_decode_structured_content(content))
+
+
+class AnthropicProvider:
+    """Read-only Anthropic adapter using a forced schema-constrained tool call."""
+
+    name = "anthropic"
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        model: str,
+        timeout_seconds: float = 20,
+        client: Any | None = None,
+    ) -> None:
+        if not api_key or not model:
+            raise ValueError("Anthropic API key and model are required")
+        self.model = model
+        self._timeout = timeout_seconds
+        self._client = client or AsyncAnthropic(
+            api_key=api_key, timeout=timeout_seconds, max_retries=0
+        )
+
+    async def generate(
+        self,
+        *,
+        agent_name: str,
+        instructions: str,
+        input_payload: str,
+        response_model: type[ResponseT],
+    ) -> ResponseT:
+        tool_name = "".join(character for character in agent_name if character.isalnum())[:48]
+        response = await asyncio.wait_for(
+            self._client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                system=instructions,
+                messages=[{"role": "user", "content": input_payload}],
+                tools=[
+                    {
+                        "name": tool_name or "AlphaDeskResponse",
+                        "description": "Return the required AlphaDesk structured response.",
+                        "input_schema": response_model.model_json_schema(),
+                    }
+                ],
+                tool_choice={"type": "tool", "name": tool_name or "AlphaDeskResponse"},
+            ),
+            timeout=self._timeout,
+        )
+        for block in response.content:
+            if getattr(block, "type", None) == "tool_use":
+                return response_model.model_validate(getattr(block, "input", None))
+        raise ValueError(f"{agent_name} returned no structured output")

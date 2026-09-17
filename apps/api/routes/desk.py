@@ -3,20 +3,21 @@ from __future__ import annotations
 # FastAPI dependencies are intentionally declared in parameter defaults.
 # ruff: noqa: B008
 import asyncio
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
+from alpaca.common.exceptions import APIError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import delete, select
 
-from packages.ai.provider import OpenRouterProvider
+from packages.ai.provider import AnthropicProvider, OpenRouterProvider
 from packages.ai.store import AIWorkflowStore
 from packages.ai.workflow import AIWorkflow
 from packages.auth.dependencies import WorkspaceContext, require_workspace
-from alpaca.common.exceptions import APIError
 from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.broker.reconciliation import BrokerExecutionGate
@@ -93,6 +94,13 @@ class OpenRouterCredentialInput(BaseModel):
     model: str = Field(min_length=2, max_length=160)
 
 
+class AnthropicCredentialInput(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    api_key: SecretStr = Field(min_length=8)
+    model: str = Field(min_length=2, max_length=160)
+
+
 class ProviderTestResult(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -127,6 +135,7 @@ class ScannerFailure(BaseModel):
 
     symbol: str
     code: Literal["REAL_DATA_UNAVAILABLE"] = "REAL_DATA_UNAVAILABLE"
+    detail: str | None = None
 
 
 class ScannerResult(BaseModel):
@@ -246,7 +255,8 @@ async def credential_statuses(
             )
         }
     return [
-        _credential_view(provider, records.get(provider)) for provider in ("ALPACA", "OPENROUTER")
+        _credential_view(provider, records.get(provider))
+        for provider in ("ALPACA", "OPENROUTER", "ANTHROPIC")
     ]
 
 
@@ -330,6 +340,46 @@ async def _test_openrouter(payload: OpenRouterCredentialInput) -> ProviderTestRe
     )
 
 
+async def _test_anthropic(payload: AnthropicCredentialInput) -> ProviderTestResult:
+    provider = AnthropicProvider(
+        payload.api_key.get_secret_value(), model=payload.model, timeout_seconds=20
+    )
+    try:
+        await provider.generate(
+            agent_name="AlphaDeskCapabilityProbe",
+            instructions="Return status ok and cite the supplied system source. No tools.",
+            input_payload='Source: {"source_id":"alphadesk-system","claim":"capability probe"}',
+            response_model=ProbeResponse,
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Anthropic model capability probe failed ({type(error).__name__})",
+        ) from error
+    return ProviderTestResult(
+        provider="ANTHROPIC",
+        status="VERIFIED",
+        detail="The model produced a schema-valid read-only response.",
+        model=payload.model,
+    )
+
+
+async def _activate_ai_provider(request: Request, workspace_id: UUID, provider: str) -> None:
+    async with request.app.state.database.sessions.begin() as session:
+        records = list(
+            await session.scalars(
+                select(WorkspaceCredentialRecord).where(
+                    WorkspaceCredentialRecord.workspace_id == workspace_id,
+                    WorkspaceCredentialRecord.provider.in_(("OPENROUTER", "ANTHROPIC")),
+                )
+            )
+        )
+        for record in records:
+            configuration = dict(record.configuration or {})
+            configuration["active"] = record.provider == provider
+            record.configuration = configuration
+
+
 @router.post("/credentials/openrouter/test", response_model=ProviderTestResult)
 async def test_openrouter_credentials(
     payload: OpenRouterCredentialInput,
@@ -354,12 +404,41 @@ async def save_openrouter_credentials(
         validation_status="VERIFIED",
         enabled=True,
     )
+    await _activate_ai_provider(request, context.workspace_id, "OPENROUTER")
     return _credential_view("OPENROUTER", record)
+
+
+@router.post("/credentials/anthropic/test", response_model=ProviderTestResult)
+async def test_anthropic_credentials(
+    payload: AnthropicCredentialInput,
+    _: WorkspaceContext = Depends(require_workspace),
+) -> ProviderTestResult:
+    return await _test_anthropic(payload)
+
+
+@router.put("/credentials/anthropic", response_model=CredentialStatusView)
+async def save_anthropic_credentials(
+    payload: AnthropicCredentialInput,
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> CredentialStatusView:
+    await _test_anthropic(payload)
+    record = await _credential_store(request).save(
+        workspace_id=context.workspace_id,
+        actor_user_id=context.principal.user_id,
+        provider="ANTHROPIC",
+        secret_payload={"api_key": payload.api_key.get_secret_value()},
+        configuration={"model": payload.model, "compatibility": "native_tool_schema"},
+        validation_status="VERIFIED",
+        enabled=True,
+    )
+    await _activate_ai_provider(request, context.workspace_id, "ANTHROPIC")
+    return _credential_view("ANTHROPIC", record)
 
 
 @router.delete("/credentials/{provider}", status_code=204)
 async def delete_credentials(
-    provider: Literal["alpaca", "openrouter"],
+    provider: Literal["alpaca", "openrouter", "anthropic"],
     request: Request,
     context: WorkspaceContext = Depends(require_workspace),
 ) -> None:
@@ -543,7 +622,7 @@ async def scan_now(
                     "failure_type": type(error).__name__,
                 },
             )
-            failures.append(ScannerFailure(symbol=symbol))
+            failures.append(ScannerFailure(symbol=symbol, detail=type(error).__name__))
     completed_run = await complete_scan_run(
         request.app.state.database.sessions,
         run.scan_run_id,
@@ -551,6 +630,20 @@ async def scan_now(
         failed_count=len(failures),
     )
     assert completed_run.completed_at is not None
+    dispositions = Counter(result.disposition for result in results)
+    logger.info(
+        "workspace_scan_completed",
+        extra={
+            "event": "workspace_scan_completed",
+            "workspace_id": str(context.workspace_id),
+            "scan_run_id": str(run.scan_run_id),
+            "trigger": run.trigger,
+            "attempted": len(symbols),
+            "completed": len(results),
+            "failed": len(failures),
+            "dispositions": dict(dispositions),
+        },
+    )
     return ScannerResult(
         scan_run_id=run.scan_run_id,
         trigger=run.trigger,
@@ -667,15 +760,39 @@ async def analyze_opportunity_with_ai(
     if opportunity_record is None:
         raise HTTPException(status_code=404, detail="Opportunity not found")
     credential_store = _credential_store(request)
-    credential = await credential_store.get(context.workspace_id, "OPENROUTER")
-    secrets = await credential_store.reveal(context.workspace_id, "OPENROUTER")
-    if credential is None or secrets is None or not credential.enabled:
-        raise HTTPException(status_code=409, detail="Verified OpenRouter credentials required")
+    async with request.app.state.database.sessions() as session:
+        credentials = list(
+            await session.scalars(
+                select(WorkspaceCredentialRecord).where(
+                    WorkspaceCredentialRecord.workspace_id == context.workspace_id,
+                    WorkspaceCredentialRecord.provider.in_(("OPENROUTER", "ANTHROPIC")),
+                    WorkspaceCredentialRecord.enabled.is_(True),
+                    WorkspaceCredentialRecord.validation_status == "VERIFIED",
+                )
+            )
+        )
+    credential = next(
+        (item for item in credentials if bool(item.configuration.get("active"))),
+        next((item for item in credentials if item.provider == "OPENROUTER"), None),
+    )
+    if credential is None:
+        raise HTTPException(status_code=409, detail="Verified AI provider credentials required")
+    secrets = await credential_store.reveal(context.workspace_id, credential.provider)
+    if secrets is None:
+        raise HTTPException(status_code=409, detail="Verified AI provider credentials required")
     model = str(credential.configuration.get("model", ""))
-    provider = OpenRouterProvider(
-        str(secrets["api_key"]),
-        model=model,
-        timeout_seconds=request.app.state.settings.ai_timeout_seconds,
+    provider = (
+        AnthropicProvider(
+            str(secrets["api_key"]),
+            model=model,
+            timeout_seconds=request.app.state.settings.ai_timeout_seconds,
+        )
+        if credential.provider == "ANTHROPIC"
+        else OpenRouterProvider(
+            str(secrets["api_key"]),
+            model=model,
+            timeout_seconds=request.app.state.settings.ai_timeout_seconds,
+        )
     )
     opportunity = ConnectedAnalysis.model_validate(opportunity_record.payload)
     evidence: dict[str, object] = {
@@ -816,9 +933,15 @@ async def close_position(
     except APIError as error:
         detail = str(error)
         if "market orders are only allowed during market hours" in detail:
-            detail = "Options market orders can only be executed during regular market hours (9:30 AM – 4:00 PM EDT). Please try again when the market opens."
+            detail = (
+                "Options market orders can only be executed during regular market hours "
+                "(9:30 AM - 4:00 PM EDT). Please try again when the market opens."
+            )
         elif "position not found" in detail:
-            detail = f"Position {symbol_or_asset_id} is already closed or does not exist on the broker."
+            detail = (
+                f"Position {symbol_or_asset_id} is already closed or does not exist "
+                "on the broker."
+            )
         raise HTTPException(status_code=400, detail=detail) from error
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
