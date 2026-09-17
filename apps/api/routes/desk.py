@@ -4,6 +4,7 @@ from __future__ import annotations
 # ruff: noqa: B008
 import asyncio
 from collections import Counter
+from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
@@ -15,8 +16,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import delete, select
 
-from packages.ai.provider import AnthropicProvider, OpenRouterProvider
+from packages.ai.provider import AIProvider, AnthropicProvider, OpenRouterProvider
 from packages.ai.store import AIWorkflowStore
+from packages.ai.watchlist import (
+    DISCOVERY_UNIVERSE,
+    WatchlistResearchReport,
+    run_watchlist_research,
+)
 from packages.ai.workflow import AIWorkflow
 from packages.auth.dependencies import WorkspaceContext, require_workspace
 from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
@@ -30,6 +36,7 @@ from packages.connected.opportunities import (
 )
 from packages.connected.option_scan_policy import ScanMode
 from packages.database.models import (
+    AIWorkflowRunRecord,
     AuditRecord,
     BrokerAccountRecord,
     BrokerOrderRecord,
@@ -153,6 +160,18 @@ class ScannerResult(BaseModel):
     attempted: int
     results: tuple[ConnectedAnalysis, ...]
     failures: tuple[ScannerFailure, ...]
+
+
+class WatchlistResearchView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    provider: str
+    model: str
+    scan_run_id: UUID
+    scan_completed_at: datetime | None
+    researched_at: datetime
+    universe: tuple[str, ...]
+    report: WatchlistResearchReport
 
 
 class ScanRunView(BaseModel):
@@ -561,6 +580,16 @@ async def replace_watchlist(
             WatchlistSymbolRecord(workspace_id=context.workspace_id, symbol=symbol, created_at=now)
             for symbol in symbols
         )
+        session.add(
+            AuditRecord(
+                audit_id=uuid4(),
+                workspace_id=context.workspace_id,
+                actor_user_id=context.principal.user_id,
+                action="WATCHLIST_REPLACED",
+                detail={"symbols": list(symbols), "source": "operator"},
+                occurred_at=now,
+            )
+        )
     return list(symbols)
 
 
@@ -793,6 +822,295 @@ async def get_scan_run_results(
             )
         )
     return [ConnectedAnalysis.model_validate(record.payload) for record in records]
+
+
+async def _save_watchlist_ai_run(
+    request: Request,
+    context: WorkspaceContext,
+    *,
+    provider: str,
+    model: str,
+    input_payload: Mapping[str, Any],
+    output_payload: Mapping[str, Any],
+    degraded: bool,
+    failure_reason: str | None,
+) -> None:
+    async with request.app.state.database.sessions.begin() as session:
+        session.add(
+            AIWorkflowRunRecord(
+                run_id=uuid4(),
+                workspace_id=context.workspace_id,
+                correlation_id=uuid4(),
+                provider=provider,
+                model=model,
+                prompt_versions={"watchlist_research": "watchlist-research-v1"},
+                schema_version=1,
+                input_payload=input_payload,
+                output_payload=output_payload,
+                degraded=degraded,
+                failure_reason=failure_reason,
+                created_at=datetime.now(UTC),
+            )
+        )
+
+
+async def _load_watchlist_ai_provider(
+    request: Request,
+    context: WorkspaceContext,
+) -> tuple[str, str, AIProvider]:
+    credential_store = _credential_store(request)
+    async with request.app.state.database.sessions() as session:
+        credentials = list(
+            await session.scalars(
+                select(WorkspaceCredentialRecord).where(
+                    WorkspaceCredentialRecord.workspace_id == context.workspace_id,
+                    WorkspaceCredentialRecord.provider.in_(("OPENROUTER", "ANTHROPIC")),
+                    WorkspaceCredentialRecord.enabled.is_(True),
+                    WorkspaceCredentialRecord.validation_status == "VERIFIED",
+                )
+            )
+        )
+    credential = next(
+        (item for item in credentials if bool(item.configuration.get("active"))),
+        next((item for item in credentials if item.provider == "OPENROUTER"), None),
+    )
+    if credential is None:
+        raise HTTPException(status_code=409, detail="Verified AI provider credentials required")
+    secrets = await credential_store.reveal(context.workspace_id, credential.provider)
+    if secrets is None:
+        raise HTTPException(status_code=409, detail="Verified AI provider credentials required")
+    model = str(credential.configuration.get("model", ""))
+    provider = (
+        AnthropicProvider(
+            str(secrets["api_key"]),
+            model=model,
+            timeout_seconds=request.app.state.settings.ai_timeout_seconds,
+        )
+        if credential.provider == "ANTHROPIC"
+        else OpenRouterProvider(
+            str(secrets["api_key"]),
+            model=model,
+            timeout_seconds=request.app.state.settings.ai_timeout_seconds,
+        )
+    )
+    return credential.provider, model, provider
+
+
+@router.post("/watchlist/research", response_model=WatchlistResearchView)
+async def research_watchlist(
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> WatchlistResearchView:
+    async with request.app.state.database.sessions() as session:
+        current_symbols = tuple(
+            await session.scalars(
+                select(WatchlistSymbolRecord.symbol)
+                .where(WatchlistSymbolRecord.workspace_id == context.workspace_id)
+                .order_by(WatchlistSymbolRecord.symbol)
+            )
+        )
+    symbols = tuple(dict.fromkeys((*current_symbols, *DISCOVERY_UNIVERSE)))
+    base_input_payload = {"universe": symbols}
+    try:
+        provider_name, model, provider = await _load_watchlist_ai_provider(request, context)
+    except HTTPException:
+        await _save_watchlist_ai_run(
+            request,
+            context,
+            provider="UNAVAILABLE",
+            model="",
+            input_payload=base_input_payload,
+            output_payload={"degraded": True, "failure_reason": "credentials_unavailable"},
+            degraded=True,
+            failure_reason="credentials_unavailable",
+        )
+        raise
+    except Exception as error:
+        failure_reason = type(error).__name__
+        await _save_watchlist_ai_run(
+            request,
+            context,
+            provider="UNAVAILABLE",
+            model="",
+            input_payload=base_input_payload,
+            output_payload={"degraded": True, "failure_reason": failure_reason},
+            degraded=True,
+            failure_reason=failure_reason,
+        )
+        raise HTTPException(status_code=503, detail="AI provider is unavailable") from error
+    try:
+        service = await _opportunity_service(request, context)
+    except HTTPException:
+        await _save_watchlist_ai_run(
+            request,
+            context,
+            provider=provider_name,
+            model=model,
+            input_payload=base_input_payload,
+            output_payload={"degraded": True, "failure_reason": "market_data_unavailable"},
+            degraded=True,
+            failure_reason="market_data_unavailable",
+        )
+        raise
+    except Exception as error:
+        failure_reason = type(error).__name__
+        await _save_watchlist_ai_run(
+            request,
+            context,
+            provider=provider_name,
+            model=model,
+            input_payload=base_input_payload,
+            output_payload={"degraded": True, "failure_reason": failure_reason},
+            degraded=True,
+            failure_reason=failure_reason,
+        )
+        raise HTTPException(status_code=503, detail="Market data is unavailable") from error
+    research_run = await start_scan_run(
+        request.app.state.database.sessions,
+        context.workspace_id,
+        trigger="AI_RESEARCH",
+        attempted_count=len(symbols),
+    )
+    results: list[ConnectedAnalysis] = []
+    failures: list[ScannerFailure] = []
+    settled_symbols: set[str] = set()
+    try:
+        async with asyncio.timeout(300):
+            for symbol in symbols:
+                try:
+                    results.append(
+                        await asyncio.wait_for(
+                            service.analyze(
+                                symbol,
+                                scan_run_id=research_run.scan_run_id,
+                                mode=ScanMode.PRE_SCAN,
+                                create_intent=False,
+                            ),
+                            timeout=30,
+                        )
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "watchlist_research_symbol_unavailable",
+                        extra={
+                            "event": "watchlist_research_symbol_unavailable",
+                            "workspace_id": str(context.workspace_id),
+                            "symbol": symbol,
+                            "failure_type": type(error).__name__,
+                        },
+                    )
+                    failures.append(ScannerFailure(symbol=symbol, detail=type(error).__name__))
+                    settled_symbols.add(symbol)
+                else:
+                    settled_symbols.add(symbol)
+    except TimeoutError:
+        failures.extend(
+            ScannerFailure(symbol=symbol, detail="RESEARCH_TIMEOUT")
+            for symbol in symbols
+            if symbol not in settled_symbols
+        )
+    finally:
+        try:
+            completed_run = await complete_scan_run(
+                request.app.state.database.sessions,
+                research_run.scan_run_id,
+                completed_count=len(results),
+                failed_count=len(failures),
+            )
+        except Exception as error:
+            logger.exception(
+                "watchlist_research_scan_finalize_failed",
+                extra={
+                    "event": "watchlist_research_scan_finalize_failed",
+                    "workspace_id": str(context.workspace_id),
+                    "scan_run_id": str(research_run.scan_run_id),
+                    "failure_type": type(error).__name__,
+                },
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Research scan could not be finalized",
+            ) from error
+
+    by_symbol = {
+        result.symbol: result for result in results
+    }
+    evidence = tuple(
+        {
+            "source_id": f"scan-{symbol}",
+            "symbol": symbol,
+            "observed_at": by_symbol[symbol].observed_at.isoformat()
+            if symbol in by_symbol
+            else None,
+            "status": "AVAILABLE" if symbol in by_symbol else "UNAVAILABLE_FROM_DISCOVERY_SCAN",
+            "disposition": by_symbol[symbol].disposition if symbol in by_symbol else None,
+            "signal": by_symbol[symbol].signal if symbol in by_symbol else None,
+            "trade_idea": by_symbol[symbol].trade_idea if symbol in by_symbol else None,
+            "candidate": by_symbol[symbol].candidate if symbol in by_symbol else None,
+            "risk_decision": by_symbol[symbol].risk_decision if symbol in by_symbol else None,
+            "option_diagnostics": (
+                by_symbol[symbol].option_diagnostics if symbol in by_symbol else None
+            ),
+            "reason_codes": by_symbol[symbol].reason_codes if symbol in by_symbol else (),
+        }
+        for symbol in symbols
+    )
+    input_payload = {
+        "universe": symbols,
+        "sources": evidence,
+        "scan_run_id": str(research_run.scan_run_id),
+    }
+
+    try:
+        report = await run_watchlist_research(provider, symbols=symbols, evidence=evidence)
+        assert completed_run.completed_at is not None
+        report = report.model_copy(update={"as_of": completed_run.completed_at})
+    except Exception as error:
+        failure_reason = type(error).__name__
+        await _save_watchlist_ai_run(
+            request,
+            context,
+            provider=provider_name,
+            model=model,
+            input_payload=input_payload,
+            output_payload={"degraded": True, "failure_reason": failure_reason},
+            degraded=True,
+            failure_reason=failure_reason,
+        )
+        logger.warning(
+            "watchlist_research_unavailable",
+            extra={
+                "event": "watchlist_research_unavailable",
+                "workspace_id": str(context.workspace_id),
+                "provider": provider_name,
+                "failure_type": type(error).__name__,
+            },
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"Watchlist research unavailable ({type(error).__name__})",
+        ) from error
+
+    researched_at = datetime.now(UTC)
+    await _save_watchlist_ai_run(
+        request,
+        context,
+        provider=provider_name,
+        model=model,
+        input_payload=input_payload,
+        output_payload=report.model_dump(mode="json"),
+        degraded=False,
+        failure_reason=None,
+    )
+    return WatchlistResearchView(
+        provider=provider_name,
+        model=model,
+        scan_run_id=research_run.scan_run_id,
+        scan_completed_at=completed_run.completed_at,
+        researched_at=researched_at,
+        universe=symbols,
+        report=report,
+    )
 
 
 @router.get("/opportunities", response_model=list[ConnectedAnalysis])

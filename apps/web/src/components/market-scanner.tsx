@@ -1,6 +1,6 @@
 "use client";
 
-import { AlertTriangle, Clock3, History, Play, Radar, RefreshCw } from "lucide-react";
+import { AlertTriangle, Bot, Check, Clock3, History, Play, Radar, RefreshCw, ShieldCheck } from "lucide-react";
 import Link from "next/link";
 import { FormEvent, useEffect, useState } from "react";
 
@@ -13,6 +13,8 @@ type ScanFailure = { symbol: string; code: "REAL_DATA_UNAVAILABLE" };
 type ScanResult = { scan_run_id: string; trigger: string; started_at: string; completed_at: string; attempted: number; results: Analysis[]; failures: ScanFailure[] };
 type ScanRun = { scan_run_id: string; trigger: string; source: string; started_at: string; completed_at: string | null; attempted: number; completed: number; failed: number };
 type MarketClock = { is_open: boolean; timestamp: string; next_open: string; next_close: string; timezone: string; regular_session: string; source: string };
+type WatchlistRecommendation = { symbol: string; action: "KEEP" | "DROP" | "WATCH"; rank: number; rationale: string; option_assessment: "EXECUTION_ELIGIBLE" | "REVIEW_ONLY" | "NOT_ELIGIBLE" | "INSUFFICIENT_DATA"; option_reason: string; risks: string[]; confidence: number; citations: { source_id: string; claim: string }[] };
+type WatchlistResearch = { provider: string; model: string; scan_run_id: string; scan_completed_at: string | null; researched_at: string; universe: string[]; report: { summary: string; limitations: string[]; recommendations: WatchlistRecommendation[]; as_of: string } };
 
 const easternTime = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit", second: "2-digit", timeZoneName: "short" });
 const easternDateTime = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" });
@@ -39,6 +41,9 @@ export function MarketScanner() {
   const [now, setNow] = useState(() => new Date());
   const [busy, setBusy] = useState(false);
   const [historyBusy, setHistoryBusy] = useState(false);
+  const [researchBusy, setResearchBusy] = useState(false);
+  const [research, setResearch] = useState<WatchlistResearch | null>(null);
+  const [researchSelection, setResearchSelection] = useState<string[]>([]);
   const [message, setMessage] = useState("");
 
 
@@ -114,6 +119,35 @@ export function MarketScanner() {
     }
   }
 
+  async function researchWatchlist() {
+    setResearchBusy(true);
+    setMessage("Reviewing the latest real-data scan with the configured AI provider…");
+    try {
+      const result = await deskFetch<WatchlistResearch>("/desk/watchlist/research", { method: "POST" });
+      setResearch(result);
+      setResearchSelection(result.report.recommendations.filter((item) => item.action === "KEEP").map((item) => item.symbol));
+      setMessage("Research complete. Review the advisory notes, then choose what to save.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Watchlist research unavailable");
+    } finally {
+      setResearchBusy(false);
+    }
+  }
+
+  async function saveResearchSelection() {
+    if (researchSelection.length === 0) {
+      setMessage("Select at least one symbol before saving the researched watchlist.");
+      return;
+    }
+    try {
+      const saved = await deskFetch<string[]>("/desk/watchlist", { method: "PUT", body: JSON.stringify({ symbols: researchSelection }) });
+      setSymbols(saved);
+      setMessage("Selected researched watchlist saved. The scanner will use it for future scans.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Watchlist save failed");
+    }
+  }
+
   async function scan() {
     setBusy(true);
     setMessage("Scanning real Alpaca market, news, contract, quote, and Greek sources…");
@@ -185,6 +219,18 @@ export function MarketScanner() {
     <div className="scanner-toolbar"><div><small>{latestSelected ? "LATEST SCAN RESULTS" : "HISTORICAL SCAN RESULTS"}</small><strong>{selectedRun ? `${selectedRun.completed} / ${selectedRun.attempted} watchlist symbols` : `${symbols.length} / 25 watchlist symbols`}</strong>{selectedRun ? <span>{easternDateTime.format(new Date(selectedRun.started_at))} · {selectedRun.trigger.toLowerCase()}</span> : null}<span>{Object.entries(dispositionCounts).map(([name, count]) => `${count} ${name.replaceAll("_", " ")}`).join(" · ") || "No dispositions yet"}</span></div><label className="toggle"><input type="checkbox" checked={workspace?.scanner_enabled ?? false} onChange={toggle}/><span/>5-minute market-hours scan</label><button disabled={busy || symbols.length === 0} onClick={scan}><Play/>{busy ? "Scanning…" : "Scan now"}</button></div>
     {message ? <p className="form-message">{message}</p> : null}
     <form className="watchlist-form" onSubmit={saveWatchlist}><label>Replace watchlist (comma or space separated)<input value={entry} onChange={(event) => setEntry(event.target.value)} placeholder={symbols.join(", ") || "SPY, QQQ, AAPL, MSFT"}/></label><button className="secondary-button">Save watchlist</button></form>
+
+    <section className="watchlist-research-panel">
+      <header className="watchlist-research-header"><div><small>READ-ONLY AI RESEARCH</small><h2>Discover a fresh watchlist</h2><p>Scan the current list plus a broader liquid, option-relevant universe, then ask the configured provider to recommend up to 20 symbols. It can explain and recommend; it cannot trade or change this list.</p></div><button onClick={() => void researchWatchlist()} disabled={researchBusy}><Bot/>{researchBusy ? "Researching…" : "Discover watchlist"}</button></header>
+      <div className="research-safety-note"><ShieldCheck/><span><strong>Review first.</strong> Nothing is saved until you select symbols and press <b>Save selected watchlist</b>. Recommendations are not trade approvals.</span></div>
+      {research ? <>
+        <div className="research-meta"><span>{research.provider} · {research.model}</span><span>{research.universe.length} symbols evaluated · up to 20 recommendations</span><span>Scan: {research.scan_completed_at ? easternDateTime.format(new Date(research.scan_completed_at)) : "completion time unavailable"}</span><span>Research: {easternDateTime.format(new Date(research.researched_at))}</span></div>
+        <p className="research-summary">{research.report.summary}</p>
+        <div className="research-grid">{[...research.report.recommendations].sort((a, b) => a.rank - b.rank).map((item) => <label className={`research-card ${researchSelection.includes(item.symbol) ? "selected" : ""}`} key={item.symbol}><input type="checkbox" checked={researchSelection.includes(item.symbol)} onChange={(event) => setResearchSelection((current) => event.target.checked ? [...current, item.symbol] : current.filter((symbol) => symbol !== item.symbol))}/><div><div className="research-card-heading"><strong>#{item.rank} {item.symbol}</strong><span className={`research-action ${item.action.toLowerCase()}`}>{item.action}</span><span className="research-confidence">{(item.confidence * 100).toFixed(0)}% confidence</span></div><p>{item.rationale}</p><small className={`research-option ${item.option_assessment.toLowerCase()}`}>Option review: {item.option_assessment.replaceAll("_", " ")} · {item.option_reason}</small><small>Risks: {item.risks.join(" · ")}</small><small>Cited evidence: {item.citations.map((citation) => citation.source_id).join(", ")}</small></div></label>)}</div>
+        <div className="button-row research-save-row"><button onClick={() => void saveResearchSelection()} disabled={researchSelection.length === 0}><Check/>Save selected watchlist</button><span>{researchSelection.length} selected · this replaces the current scanner list only after confirmation</span></div>
+        <div className="research-limitations"><strong>Limitations</strong>{research.report.limitations.map((limitation) => <span key={limitation}>· {limitation}</span>)}</div>
+      </> : <p className="research-empty">Discovery runs a bounded real-data scan across your current list and additional liquid candidates, then evaluates stock signal and option suitability before showing recommendations.</p>}
+    </section>
 
     <div className="scanner-results-layout">
       <section className="data-table"><header><span>OPPORTUNITY</span><span>DISPOSITION / SCORE</span><span>SOURCE</span><span>OBSERVED</span><span>ACTION</span></header>{results.length === 0 ? <div className="table-empty"><Radar/><strong>No scan results yet</strong><p>Run a scan to evaluate your watchlist using verified real Alpaca data.</p></div> : results.map((result) => <div className="data-row" key={result.opportunity_id}><strong>{result.symbol}</strong><div><span className={`status-pill ${["TRADE", "PRE_SCAN_CANDIDATE"].includes(result.disposition) ? "good" : ""}`}>{result.disposition.replaceAll("_", " ")}</span><small style={{ display: "block", marginTop: "3px" }}>Score {scoreFor(result)}</small>{result.option_diagnostics ? <small style={{ display: "block", marginTop: "3px" }}>{result.option_diagnostics.selected_contracts} reviewable · {result.option_diagnostics.strict_eligible_contracts} executable now</small> : null}{result.reason_codes.length ? <small style={{ display: "block", marginTop: "3px" }}>{result.reason_codes.join(", ")}</small> : null}</div><span>{result.source}</span><time>{easternDateTime.format(new Date(result.observed_at))}</time><Link href={`/desk/opportunities/${result.opportunity_id}`}>Review →</Link></div>)}</section>

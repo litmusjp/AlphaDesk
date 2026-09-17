@@ -19,7 +19,7 @@ from packages.broker.reconciliation import BrokerExecutionGate
 from packages.connected.option_scan_policy import ScanMode, select_contracts
 from packages.database.models import ConnectedOpportunityRecord, ConnectedScanRunRecord
 from packages.domain.options import LegSide, OptionLeg, OptionType, StructureType
-from packages.domain.workflow import CatalystFeatures, NoTrade, Signal
+from packages.domain.workflow import CatalystFeatures, NoTrade, OrderIntent, RankedCandidate, Signal
 from packages.execution.intents import create_order_intent
 from packages.options.alpaca_adapter import (
     AlpacaOptionChainAdapter,
@@ -84,6 +84,18 @@ def _news_items(raw: Any) -> list[Any]:
             values.extend(item if isinstance(item, list) else [item])
         return values
     return list(data) if isinstance(data, (list, tuple)) else []
+
+
+def _maybe_create_order_intent(
+    risk: Any,
+    candidate: RankedCandidate,
+    *,
+    mode: ScanMode,
+    create_intent: bool,
+) -> OrderIntent | None:
+    if mode is not ScanMode.EXECUTION or not create_intent or risk.decision != "APPROVE":
+        return None
+    return create_order_intent(risk, candidate)
 
 
 class ConnectedOpportunityService:
@@ -178,12 +190,14 @@ class ConnectedOpportunityService:
         )
         return features, price, now
 
+
     async def analyze(
         self,
         symbol: str,
         *,
         scan_run_id: UUID | None = None,
         mode: ScanMode = ScanMode.EXECUTION,
+        create_intent: bool = True,
     ) -> ConnectedAnalysis:
         normalized = symbol.strip().upper()
         if not normalized.isalnum() or len(normalized) > 16:
@@ -309,6 +323,18 @@ class ConnectedOpportunityService:
                 scan_run_id=scan_run_id,
                 option_diagnostics=option_diagnostics,
             )
+        strict_selection = select_contracts(
+            tuple(contracts),
+            underlying_price=underlying_price,
+            wanted_type=wanted_type,
+            as_of=now,
+            mode=ScanMode.EXECUTION,
+        )
+        strict_contract_ids = {item.contract_id for item in strict_selection.selected}
+        option_diagnostics["selected_structure_strictly_eligible"] = int(
+            long_contract.contract_id in strict_contract_ids
+            and short_contract.contract_id in strict_contract_ids
+        )
         candidate = strategy.rank_candidates(idea, (structure,))[0]
         projections = PostgresBrokerProjectionStore(self._sessions, self._workspace_id)
         account = await projections.get_account()
@@ -339,7 +365,12 @@ class ConnectedOpportunityService:
                 broker_execution_allowed=gate.allowed,
             ),
         )
-        intent = create_order_intent(risk, candidate) if risk.decision == "APPROVE" else None
+        intent = _maybe_create_order_intent(
+            risk,
+            candidate,
+            mode=mode,
+            create_intent=create_intent,
+        )
         pre_scan = mode is ScanMode.PRE_SCAN
         result = ConnectedAnalysis(
             opportunity_id=opportunity_id,
@@ -348,7 +379,11 @@ class ConnectedOpportunityService:
             disposition=(
                 ("PRE_SCAN_CANDIDATE" if pre_scan else "TRADE")
                 if intent
-                else "RISK_REJECTED"
+                else (
+                    "RESEARCH_CANDIDATE"
+                    if not create_intent and risk.decision == "APPROVE"
+                    else "RISK_REJECTED"
+                )
             ),
             observed_at=now,
             expires_at=expires_at,
