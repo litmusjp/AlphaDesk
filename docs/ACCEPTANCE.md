@@ -7,7 +7,7 @@
 | Isolation | Workspace-scoped broker, intent, Guardian, credentials, opportunities, audit, AI, outbox and NATS subject helpers; signed demo sessions | Pass; multi-tenant live isolation strictly verified with zero cross-tenant leakage |
 | Encrypted BYOK | AES-256-GCM, unique nonce, workspace/provider AAD, key version, write-only status responses, test/save/delete audit | Pass |
 | Connection supervision | Per-enabled-workspace adapter and stream, reconciliation, backoff, suspension state, connection cap | Pass; verified live with multiple Alpaca paper accounts ($5k, $100k) and worker reconciliation |
-| Real opportunities | 25-symbol watchlist, direct/periodic scans, Alpaca stock/news/options/quote/Greek evidence, live session countdown, closed-market guidance, no fixture fallback | Implemented; market entitlement dependent |
+| Real opportunities | 50-symbol watchlist, additive manual/AI discovery with explicit review, checkbox removals, direct/periodic scans, Alpaca stock/news/options/quote/Greek evidence, live session countdown, closed-market guidance, no fixture fallback | Implemented; market entitlement dependent |
 | Scan operations | Tenant-scoped manual/scheduled scan runs, per-run history, real Alpaca market clock, Eastern-time guidance, and no inferred legacy grouping | Pass; authoritative holiday scheduling remains follow-up work |
 | OpenRouter | Arbitrary model ID, schema probe, encrypted key, strict JSON/citations, response healing, no tools or execution access | Pass; live structured-output probe with `anthropic/claude-sonnet-4.6` verified |
 | Confirmed execution | Immutable review, explicit acknowledgement, fresh deterministic preflight, stable client-order ID uncertainty reconciliation | Pass with deterministic and adapter tests |

@@ -131,10 +131,20 @@ class ProbeResponse(BaseModel):
     citation: Citation
 
 
+MAX_WATCHLIST_SYMBOLS = 50
+
+
 class WatchlistInput(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    symbols: tuple[str, ...] = Field(max_length=25)
+    symbols: tuple[str, ...] = Field(max_length=MAX_WATCHLIST_SYMBOLS)
+    source: Literal["operator", "ai_research"] = "operator"
+
+
+class WatchlistRemovalInput(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    symbols: tuple[str, ...] = Field(max_length=MAX_WATCHLIST_SYMBOLS)
 
 
 class ScannerInput(BaseModel):
@@ -568,10 +578,17 @@ async def replace_watchlist(
     context: WorkspaceContext = Depends(require_workspace),
 ) -> list[str]:
     symbols = tuple(sorted({item.strip().upper() for item in payload.symbols if item.strip()}))
-    if len(symbols) > 25 or any(not item.isalnum() or len(item) > 16 for item in symbols):
+    if len(symbols) > MAX_WATCHLIST_SYMBOLS or any(
+        not item.isalnum() or len(item) > 16 for item in symbols
+    ):
         raise HTTPException(status_code=422, detail="Watchlist contains invalid symbols")
     now = datetime.now(UTC)
     async with request.app.state.database.sessions.begin() as session:
+        await session.execute(
+            select(WorkspaceRecord.workspace_id)
+            .where(WorkspaceRecord.workspace_id == context.workspace_id)
+            .with_for_update()
+        )
         await session.execute(
             delete(WatchlistSymbolRecord).where(
                 WatchlistSymbolRecord.workspace_id == context.workspace_id
@@ -591,6 +608,101 @@ async def replace_watchlist(
                 occurred_at=now,
             )
         )
+    return list(symbols)
+
+
+@router.post("/watchlist", response_model=list[str])
+async def add_to_watchlist(
+    payload: WatchlistInput,
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> list[str]:
+    additions = tuple(sorted({item.strip().upper() for item in payload.symbols if item.strip()}))
+    if any(not item.isalnum() or len(item) > 16 for item in additions):
+        raise HTTPException(status_code=422, detail="Watchlist contains invalid symbols")
+    now = datetime.now(UTC)
+    async with request.app.state.database.sessions.begin() as session:
+        await session.execute(
+            select(WorkspaceRecord.workspace_id)
+            .where(WorkspaceRecord.workspace_id == context.workspace_id)
+            .with_for_update()
+        )
+        existing = set(
+            await session.scalars(
+                select(WatchlistSymbolRecord.symbol).where(
+                    WatchlistSymbolRecord.workspace_id == context.workspace_id
+                )
+            )
+        )
+        symbols = tuple(sorted(existing | set(additions)))
+        if len(symbols) > MAX_WATCHLIST_SYMBOLS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Watchlist cannot exceed {MAX_WATCHLIST_SYMBOLS} symbols",
+            )
+        new_symbols = set(symbols) - existing
+        if new_symbols:
+            session.add_all(
+                WatchlistSymbolRecord(
+                    workspace_id=context.workspace_id, symbol=symbol, created_at=now
+                )
+                for symbol in sorted(new_symbols)
+            )
+            session.add(
+                AuditRecord(
+                    audit_id=uuid4(),
+                    workspace_id=context.workspace_id,
+                    actor_user_id=context.principal.user_id,
+                    action="WATCHLIST_SYMBOLS_ADDED",
+                    detail={"symbols": sorted(new_symbols), "source": payload.source},
+                    occurred_at=now,
+                )
+            )
+    return list(symbols)
+
+
+@router.post("/watchlist/remove", response_model=list[str])
+async def remove_from_watchlist(
+    payload: WatchlistRemovalInput,
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> list[str]:
+    removals = tuple(sorted({item.strip().upper() for item in payload.symbols if item.strip()}))
+    if any(not item.isalnum() or len(item) > 16 for item in removals):
+        raise HTTPException(status_code=422, detail="Watchlist contains invalid symbols")
+    now = datetime.now(UTC)
+    async with request.app.state.database.sessions.begin() as session:
+        await session.execute(
+            select(WorkspaceRecord.workspace_id)
+            .where(WorkspaceRecord.workspace_id == context.workspace_id)
+            .with_for_update()
+        )
+        existing = set(
+            await session.scalars(
+                select(WatchlistSymbolRecord.symbol).where(
+                    WatchlistSymbolRecord.workspace_id == context.workspace_id
+                )
+            )
+        )
+        removed = existing & set(removals)
+        if removed:
+            await session.execute(
+                delete(WatchlistSymbolRecord).where(
+                    WatchlistSymbolRecord.workspace_id == context.workspace_id,
+                    WatchlistSymbolRecord.symbol.in_(removed),
+                )
+            )
+            session.add(
+                AuditRecord(
+                    audit_id=uuid4(),
+                    workspace_id=context.workspace_id,
+                    actor_user_id=context.principal.user_id,
+                    action="WATCHLIST_SYMBOLS_REMOVED",
+                    detail={"symbols": sorted(removed), "source": "operator"},
+                    occurred_at=now,
+                )
+            )
+        symbols = tuple(sorted(existing - removed))
     return list(symbols)
 
 

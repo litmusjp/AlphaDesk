@@ -58,7 +58,7 @@ export function DeskOverview() {
     <div className="state-grid">
       <StateCard title="PAPER EQUITY" value={data.account ? `$${Number(data.account.equity).toLocaleString()}` : "—"} detail="Broker-confirmed only"/>
       <StateCard title="BROKER STATE" value={data.broker.state} detail={data.broker.stream_connected ? "trade_updates connected" : "stream unavailable"} tone={data.broker.state === "RECONCILED" ? "good" : "warn"}/>
-      <StateCard title="SCANNER" value={data.workspace.scanner_enabled ? "ENABLED" : "OFF"} detail={`${data.workspace.watchlist_count} / 25 symbols`}/>
+      <StateCard title="SCANNER" value={data.workspace.scanner_enabled ? "ENABLED" : "OFF"} detail={`${data.workspace.watchlist_count} / 50 symbols`}/>
     </div>
     <div className="mode-banner blue"><ShieldCheck/><div><strong>Workspace boundary active for {data.identity.email}</strong><span>No browser-supplied workspace ID is accepted. Account, events, orders, and Guardian state are server-derived from this identity.</span></div></div>
     <div className="panel-grid three">

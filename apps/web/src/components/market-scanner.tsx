@@ -2,7 +2,7 @@
 
 import { AlertTriangle, Bot, Check, Clock3, History, Play, Radar, RefreshCw, ShieldCheck } from "lucide-react";
 import Link from "next/link";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
 import { deskFetch } from "@/lib/api";
 
@@ -32,6 +32,7 @@ function formatCountdown(target: string | null, current: Date): string | null {
 
 export function MarketScanner() {
   const [symbols, setSymbols] = useState<string[]>([]);
+  const [watchlistSelection, setWatchlistSelection] = useState<string[]>([]);
   const [entry, setEntry] = useState("");
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [results, setResults] = useState<Analysis[]>([]);
@@ -41,10 +42,12 @@ export function MarketScanner() {
   const [now, setNow] = useState(() => new Date());
   const [busy, setBusy] = useState(false);
   const [historyBusy, setHistoryBusy] = useState(false);
+  const [watchlistBusy, setWatchlistBusy] = useState(false);
   const [researchBusy, setResearchBusy] = useState(false);
   const [research, setResearch] = useState<WatchlistResearch | null>(null);
   const [researchSelection, setResearchSelection] = useState<string[]>([]);
   const [message, setMessage] = useState("");
+  const watchlistMutationEpoch = useRef(0);
 
 
   async function selectRun(run: ScanRun) {
@@ -72,6 +75,7 @@ export function MarketScanner() {
   useEffect(() => {
     let active = true;
     async function initialize() {
+      const initialWatchlistEpoch = watchlistMutationEpoch.current;
       try {
         const [watchlist, space, scanRuns, marketClock] = await Promise.all([
           deskFetch<string[]>("/desk/watchlist"),
@@ -80,7 +84,10 @@ export function MarketScanner() {
           deskFetch<MarketClock>("/desk/market-clock"),
         ]);
         if (!active) return;
-        setSymbols(watchlist);
+        if (watchlistMutationEpoch.current === initialWatchlistEpoch) {
+          setSymbols(watchlist);
+          setWatchlistSelection(watchlist);
+        }
         setWorkspace(space);
         setRuns(scanRuns);
         setClock(marketClock);
@@ -107,15 +114,49 @@ export function MarketScanner() {
     };
   }, []);
 
-  async function saveWatchlist(event: FormEvent) {
+  async function addSymbols(event: FormEvent) {
     event.preventDefault();
-    const next = Array.from(new Set(entry.split(/[\s,]+/).map((value) => value.trim().toUpperCase()).filter(Boolean))).slice(0, 25);
+    if (watchlistBusy || researchBusy) return;
+    const additions = Array.from(new Set(entry.split(/[\s,]+/).map((value) => value.trim().toUpperCase()).filter(Boolean)));
+    if (additions.length === 0) {
+      setMessage("Enter at least one symbol to add.");
+      return;
+    }
+    const existingSymbols = new Set(symbols);
+    const pendingSelection = new Set(watchlistSelection);
+    const pendingRemovals = new Set(symbols.filter((symbol) => !pendingSelection.has(symbol)));
+    watchlistMutationEpoch.current += 1;
+    setWatchlistBusy(true);
     try {
-      setSymbols(await deskFetch<string[]>("/desk/watchlist", { method: "PUT", body: JSON.stringify({ symbols: next }) }));
+      await deskFetch<string[]>("/desk/watchlist", { method: "POST", body: JSON.stringify({ symbols: additions, source: "operator" }) });
+      const saved = await deskFetch<string[]>("/desk/watchlist");
+      setSymbols(saved);
+      setWatchlistSelection(saved.filter((symbol) => !pendingRemovals.has(symbol)));
       setEntry("");
-      setMessage("Watchlist updated.");
+      const addedCount = additions.filter((symbol) => !existingSymbols.has(symbol)).length;
+      setMessage(`${addedCount} new symbol${addedCount === 1 ? "" : "s"} added. Existing symbols were kept.`);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Update failed");
+      setMessage(error instanceof Error ? error.message : "Unable to add symbols");
+    } finally {
+      setWatchlistBusy(false);
+    }
+  }
+
+  async function saveWatchlistChanges() {
+    if (watchlistBusy || researchBusy) return;
+    const pendingRemovals = symbols.filter((symbol) => !watchlistSelection.includes(symbol));
+    if (pendingRemovals.length === 0) return;
+    watchlistMutationEpoch.current += 1;
+    setWatchlistBusy(true);
+    try {
+      const saved = await deskFetch<string[]>("/desk/watchlist/remove", { method: "POST", body: JSON.stringify({ symbols: pendingRemovals }) });
+      setSymbols(saved);
+      setWatchlistSelection(saved);
+      setMessage("Watchlist changes saved.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Watchlist changes failed");
+    } finally {
+      setWatchlistBusy(false);
     }
   }
 
@@ -139,16 +180,31 @@ export function MarketScanner() {
       setMessage("Select at least one symbol before saving the researched watchlist.");
       return;
     }
+    if (watchlistBusy || researchBusy) return;
+    const additions = researchSelection.filter((symbol) => !symbols.includes(symbol));
+    if (additions.length === 0) {
+      setMessage("All selected recommendations are already on the watchlist.");
+      return;
+    }
+    const pendingSelection = new Set(watchlistSelection);
+    const pendingRemovals = new Set(symbols.filter((symbol) => !pendingSelection.has(symbol)));
+    watchlistMutationEpoch.current += 1;
+    setWatchlistBusy(true);
     try {
-      const saved = await deskFetch<string[]>("/desk/watchlist", { method: "PUT", body: JSON.stringify({ symbols: researchSelection }) });
+      await deskFetch<string[]>("/desk/watchlist", { method: "POST", body: JSON.stringify({ symbols: additions, source: "ai_research" }) });
+      const saved = await deskFetch<string[]>("/desk/watchlist");
       setSymbols(saved);
-      setMessage("Selected researched watchlist saved. The scanner will use it for future scans.");
+      setWatchlistSelection(saved.filter((symbol) => !pendingRemovals.has(symbol)));
+      setMessage(`${additions.length} researched symbol${additions.length === 1 ? "" : "s"} added. Existing symbols were kept.`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Watchlist save failed");
+    } finally {
+      setWatchlistBusy(false);
     }
   }
 
   async function scan() {
+    if (busy || watchlistBusy || researchBusy) return;
     setBusy(true);
     setMessage("Scanning real Alpaca market, news, contract, quote, and Greek sources…");
     try {
@@ -216,18 +272,25 @@ export function MarketScanner() {
       </div>
     ) : null}
 
-    <div className="scanner-toolbar"><div><small>{latestSelected ? "LATEST SCAN RESULTS" : "HISTORICAL SCAN RESULTS"}</small><strong>{selectedRun ? `${selectedRun.completed} / ${selectedRun.attempted} watchlist symbols` : `${symbols.length} / 25 watchlist symbols`}</strong>{selectedRun ? <span>{easternDateTime.format(new Date(selectedRun.started_at))} · {selectedRun.trigger.toLowerCase()}</span> : null}<span>{Object.entries(dispositionCounts).map(([name, count]) => `${count} ${name.replaceAll("_", " ")}`).join(" · ") || "No dispositions yet"}</span></div><label className="toggle"><input type="checkbox" checked={workspace?.scanner_enabled ?? false} onChange={toggle}/><span/>5-minute market-hours scan</label><button disabled={busy || symbols.length === 0} onClick={scan}><Play/>{busy ? "Scanning…" : "Scan now"}</button></div>
+    <div className="scanner-toolbar"><div><small>{latestSelected ? "LATEST SCAN RESULTS" : "HISTORICAL SCAN RESULTS"}</small><strong>{selectedRun ? `${selectedRun.completed} / ${selectedRun.attempted} watchlist symbols` : `${symbols.length} / 50 watchlist symbols`}</strong>{selectedRun ? <span>{easternDateTime.format(new Date(selectedRun.started_at))} · {selectedRun.trigger.toLowerCase()}</span> : null}<span>{Object.entries(dispositionCounts).map(([name, count]) => `${count} ${name.replaceAll("_", " ")}`).join(" · ") || "No dispositions yet"}</span></div><label className="toggle"><input disabled={busy || watchlistBusy || researchBusy} type="checkbox" checked={workspace?.scanner_enabled ?? false} onChange={toggle}/><span/>5-minute market-hours scan</label><button disabled={busy || watchlistBusy || researchBusy || symbols.length === 0} onClick={scan}><Play/>{busy ? "Scanning…" : "Scan now"}</button></div>
     {message ? <p className="form-message">{message}</p> : null}
-    <form className="watchlist-form" onSubmit={saveWatchlist}><label>Replace watchlist (comma or space separated)<input value={entry} onChange={(event) => setEntry(event.target.value)} placeholder={symbols.join(", ") || "SPY, QQQ, AAPL, MSFT"}/></label><button className="secondary-button">Save watchlist</button></form>
+    <section className="watchlist-manager" aria-labelledby="active-watchlist-title">
+      <div className="watchlist-manager-header"><div><small>ACTIVE WATCHLIST</small><h2 id="active-watchlist-title">{symbols.length} / 50 symbols</h2><p>Scroll this list to review the symbols used by the scanner. Uncheck symbols to remove them, then save the changes.</p></div><span className="watchlist-selection-count">{watchlistSelection.length} selected</span></div>
+      <form className="watchlist-form" onSubmit={addSymbols}><label>Add symbols (comma or space separated)<input disabled={watchlistBusy || researchBusy} value={entry} onChange={(event) => setEntry(event.target.value)} placeholder="SPY, QQQ, AAPL, MSFT"/></label><button className="secondary-button" disabled={watchlistBusy || researchBusy}>{watchlistBusy ? "Saving…" : "Add to watchlist"}</button></form>
+      <div className="watchlist-symbol-list" role="group" aria-label="Active watchlist symbols">
+        {symbols.length === 0 ? <p className="watchlist-empty">No symbols yet. Add symbols manually or discover recommendations below.</p> : symbols.map((symbol) => <label className="watchlist-symbol" key={symbol}><input disabled={watchlistBusy || researchBusy} type="checkbox" checked={watchlistSelection.includes(symbol)} onChange={(event) => setWatchlistSelection((current) => event.target.checked ? [...current, symbol] : current.filter((item) => item !== symbol))}/><strong>{symbol}</strong><span>{watchlistSelection.includes(symbol) ? "Watching" : "Unselected"}</span></label>)}
+      </div>
+      <div className="button-row watchlist-actions"><button type="button" onClick={() => void saveWatchlistChanges()} disabled={watchlistBusy || researchBusy || (watchlistSelection.length === symbols.length && symbols.every((symbol) => watchlistSelection.includes(symbol)))}>Save watchlist changes</button><span role="status" aria-live="polite">Unchecking does not remove a symbol until you save.</span></div>
+    </section>
 
     <section className="watchlist-research-panel">
-      <header className="watchlist-research-header"><div><small>READ-ONLY AI RESEARCH</small><h2>Discover a fresh watchlist</h2><p>Scan the current list plus a broader liquid, option-relevant universe, then ask the configured provider to recommend up to 20 symbols. It can explain and recommend; it cannot trade or change this list.</p></div><button onClick={() => void researchWatchlist()} disabled={researchBusy}><Bot/>{researchBusy ? "Researching…" : "Discover watchlist"}</button></header>
-      <div className="research-safety-note"><ShieldCheck/><span><strong>Review first.</strong> Nothing is saved until you select symbols and press <b>Save selected watchlist</b>. Recommendations are not trade approvals.</span></div>
+      <header className="watchlist-research-header"><div><small>READ-ONLY AI RESEARCH</small><h2>Discover additions</h2><p>Scan the current list plus a broader liquid, option-relevant universe, then ask the configured provider to recommend up to 20 symbols. Research never replaces or changes this list until you explicitly add selections.</p></div><button onClick={() => void researchWatchlist()} disabled={researchBusy || watchlistBusy}><Bot/>{researchBusy ? "Researching…" : "Discover watchlist"}</button></header>
+      <div className="research-safety-note"><ShieldCheck/><span><strong>Review first.</strong> Nothing is saved until you select symbols and press <b>Add selected to watchlist</b>. Recommendations are not trade approvals.</span></div>
       {research ? <>
         <div className="research-meta"><span>{research.provider} · {research.model}</span><span>{research.universe.length} symbols evaluated · up to 20 recommendations</span><span>Scan: {research.scan_completed_at ? easternDateTime.format(new Date(research.scan_completed_at)) : "completion time unavailable"}</span><span>Research: {easternDateTime.format(new Date(research.researched_at))}</span></div>
         <p className="research-summary">{research.report.summary}</p>
-        <div className="research-grid">{[...research.report.recommendations].sort((a, b) => a.rank - b.rank).map((item) => <label className={`research-card ${researchSelection.includes(item.symbol) ? "selected" : ""}`} key={item.symbol}><input type="checkbox" checked={researchSelection.includes(item.symbol)} onChange={(event) => setResearchSelection((current) => event.target.checked ? [...current, item.symbol] : current.filter((symbol) => symbol !== item.symbol))}/><div><div className="research-card-heading"><strong>#{item.rank} {item.symbol}</strong><span className={`research-action ${item.action.toLowerCase()}`}>{item.action}</span><span className="research-confidence">{(item.confidence * 100).toFixed(0)}% confidence</span></div><p>{item.rationale}</p><small className={`research-option ${item.option_assessment.toLowerCase()}`}>Option review: {item.option_assessment.replaceAll("_", " ")} · {item.option_reason}</small><small>Risks: {item.risks.join(" · ")}</small><small>Cited evidence: {item.citations.map((citation) => citation.source_id).join(", ")}</small></div></label>)}</div>
-        <div className="button-row research-save-row"><button onClick={() => void saveResearchSelection()} disabled={researchSelection.length === 0}><Check/>Save selected watchlist</button><span>{researchSelection.length} selected · this replaces the current scanner list only after confirmation</span></div>
+        <div className="research-grid">{[...research.report.recommendations].sort((a, b) => a.rank - b.rank).map((item) => <label className={`research-card ${researchSelection.includes(item.symbol) ? "selected" : ""}`} key={item.symbol}><input disabled={researchBusy || watchlistBusy} type="checkbox" checked={researchSelection.includes(item.symbol)} onChange={(event) => setResearchSelection((current) => event.target.checked ? [...current, item.symbol] : current.filter((symbol) => symbol !== item.symbol))}/><div><div className="research-card-heading"><strong>#{item.rank} {item.symbol}</strong><span className={`research-action ${item.action.toLowerCase()}`}>{item.action}</span><span className="research-confidence">{(item.confidence * 100).toFixed(0)}% confidence</span></div><p>{item.rationale}</p><small className={`research-option ${item.option_assessment.toLowerCase()}`}>Option review: {item.option_assessment.replaceAll("_", " ")} · {item.option_reason}</small><small>Risks: {item.risks.join(" · ")}</small><small>Cited evidence: {item.citations.map((citation) => citation.source_id).join(", ")}</small></div></label>)}</div>
+        <div className="button-row research-save-row"><button onClick={() => void saveResearchSelection()} disabled={researchBusy || watchlistBusy || researchSelection.length === 0}><Check/>Add selected to watchlist</button><span>{researchSelection.length} selected · existing symbols stay in place</span></div>
         <div className="research-limitations"><strong>Limitations</strong>{research.report.limitations.map((limitation) => <span key={limitation}>· {limitation}</span>)}</div>
       </> : <p className="research-empty">Discovery runs a bounded real-data scan across your current list and additional liquid candidates, then evaluates stock signal and option suitability before showing recommendations.</p>}
     </section>
