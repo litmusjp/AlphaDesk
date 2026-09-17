@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from packages.ai.provider import FixtureAIProvider
-from packages.ai.watchlist import DISCOVERY_UNIVERSE, run_watchlist_research
+from packages.ai.watchlist import DISCOVERY_UNIVERSE, _compact_evidence, run_watchlist_research
 
 
 def test_discovery_universe_includes_existing_symbols_and_additional_candidates() -> None:
@@ -14,6 +14,40 @@ def test_discovery_universe_includes_existing_symbols_and_additional_candidates(
     )
     assert len(DISCOVERY_UNIVERSE) >= 20
     assert "PLTR" in DISCOVERY_UNIVERSE
+
+
+def test_watchlist_research_compacts_option_evidence_without_losing_contract_identity() -> None:
+    compacted = _compact_evidence(
+        (
+            {
+                "source_id": "scan-AAPL",
+                "symbol": "AAPL",
+                "status": "AVAILABLE",
+                "candidate": {
+                    "structure_id": "structure-1",
+                    "structure": {
+                        "structure_type": "bull_call_debit_spread",
+                        "legs": [
+                            {
+                                "side": "long",
+                                "ratio": 1,
+                                "contract": {
+                                    "contract_id": "contract-1",
+                                    "symbol": "AAPL250117C00200000",
+                                    "quote": {"bid": "1", "ask": "2"},
+                                },
+                            }
+                        ],
+                    },
+                },
+            },
+        )
+    )
+
+    candidate = compacted[0]["candidate"]
+    assert isinstance(candidate, dict)
+    assert candidate["structure"]["legs"][0]["contract"]["contract_id"] == "contract-1"
+    assert "quote" not in candidate["structure"]["legs"][0]["contract"]
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
+from anthropic import APITimeoutError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import delete, select
@@ -857,6 +858,8 @@ async def _save_watchlist_ai_run(
 async def _load_watchlist_ai_provider(
     request: Request,
     context: WorkspaceContext,
+    *,
+    timeout_seconds: int,
 ) -> tuple[str, str, AIProvider]:
     credential_store = _credential_store(request)
     async with request.app.state.database.sessions() as session:
@@ -884,13 +887,13 @@ async def _load_watchlist_ai_provider(
         AnthropicProvider(
             str(secrets["api_key"]),
             model=model,
-            timeout_seconds=request.app.state.settings.ai_timeout_seconds,
+            timeout_seconds=timeout_seconds,
         )
         if credential.provider == "ANTHROPIC"
         else OpenRouterProvider(
             str(secrets["api_key"]),
             model=model,
-            timeout_seconds=request.app.state.settings.ai_timeout_seconds,
+            timeout_seconds=timeout_seconds,
         )
     )
     return credential.provider, model, provider
@@ -911,8 +914,13 @@ async def research_watchlist(
         )
     symbols = tuple(dict.fromkeys((*current_symbols, *DISCOVERY_UNIVERSE)))
     base_input_payload = {"universe": symbols}
+    watchlist_ai_timeout = min(max(request.app.state.settings.ai_timeout_seconds, 60), 120)
     try:
-        provider_name, model, provider = await _load_watchlist_ai_provider(request, context)
+        provider_name, model, provider = await _load_watchlist_ai_provider(
+            request,
+            context,
+            timeout_seconds=watchlist_ai_timeout,
+        )
     except HTTPException:
         await _save_watchlist_ai_run(
             request,
@@ -1065,6 +1073,34 @@ async def research_watchlist(
         report = await run_watchlist_research(provider, symbols=symbols, evidence=evidence)
         assert completed_run.completed_at is not None
         report = report.model_copy(update={"as_of": completed_run.completed_at})
+    except (APITimeoutError, TimeoutError) as error:
+        failure_reason = "AI_PROVIDER_TIMEOUT"
+        await _save_watchlist_ai_run(
+            request,
+            context,
+            provider=provider_name,
+            model=model,
+            input_payload=input_payload,
+            output_payload={"degraded": True, "failure_reason": failure_reason},
+            degraded=True,
+            failure_reason=failure_reason,
+        )
+        logger.warning(
+            "watchlist_research_provider_timeout",
+            extra={
+                "event": "watchlist_research_provider_timeout",
+                "workspace_id": str(context.workspace_id),
+                "provider": provider_name,
+                "timeout_seconds": watchlist_ai_timeout,
+            },
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Watchlist AI research timed out; the market scan completed "
+                "but no recommendations were returned"
+            ),
+        ) from error
     except Exception as error:
         failure_reason = type(error).__name__
         await _save_watchlist_ai_run(
