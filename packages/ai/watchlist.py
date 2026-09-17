@@ -98,6 +98,69 @@ scanner signals rather than fundamental research. Return only the required schem
 """
 
 
+def _compact_candidate(candidate: object) -> dict[str, object] | None:
+    if not isinstance(candidate, dict):
+        return None
+    structure = candidate.get("structure")
+    compact: dict[str, object] = {
+        "structure_id": candidate.get("structure_id"),
+        "trade_idea_id": candidate.get("trade_idea_id"),
+        "rank_score": candidate.get("rank_score"),
+        "rank_components": candidate.get("rank_components"),
+    }
+    if not isinstance(structure, dict):
+        return compact
+    compact["structure"] = {
+        "structure_type": structure.get("structure_type"),
+        "quantity": structure.get("quantity"),
+        "net_premium_per_share": structure.get("net_premium_per_share"),
+        "max_loss": structure.get("max_loss"),
+        "max_profit": structure.get("max_profit"),
+        "break_evens": structure.get("break_evens"),
+        "greeks": structure.get("greeks"),
+        "legs": [
+            {
+                "side": leg.get("side"),
+                "ratio": leg.get("ratio"),
+                "contract": {
+                    key: contract.get(key)
+                    for key in (
+                        "contract_id",
+                        "symbol",
+                        "expiration",
+                        "strike",
+                        "option_type",
+                        "tradable",
+                    )
+                },
+            }
+            for leg in structure.get("legs", [])
+            if isinstance(leg, dict) and isinstance(leg.get("contract"), dict)
+            for contract in (leg["contract"],)
+        ],
+    }
+    return compact
+
+
+def _compact_evidence(evidence: tuple[dict[str, object], ...]) -> tuple[dict[str, object], ...]:
+    return tuple(
+        {
+            "source_id": item.get("source_id"),
+            "symbol": item.get("symbol"),
+            "observed_at": item.get("observed_at"),
+            "status": item.get("status"),
+            "disposition": item.get("disposition"),
+            "signal": item.get("signal"),
+            "trade_idea": item.get("trade_idea"),
+            "candidate": _compact_candidate(item.get("candidate")),
+            "risk_decision": item.get("risk_decision"),
+            "option_diagnostics": item.get("option_diagnostics"),
+            "reason_codes": item.get("reason_codes"),
+        }
+        for item in evidence
+    )
+
+
 async def run_watchlist_research(
     provider: AIProvider,
     *,
@@ -119,7 +182,7 @@ async def run_watchlist_research(
         agent_name="watchlist_research",
         instructions=WATCHLIST_RESEARCH_PROMPT,
         input_payload=json.dumps(
-            {"universe": universe, "sources": evidence},
+            {"universe": universe, "sources": _compact_evidence(evidence)},
             sort_keys=True,
             separators=(",", ":"),
         ),
