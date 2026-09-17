@@ -48,6 +48,20 @@ class FakeDataClient:
         }
 
 
+class EmptyDataClient:
+    def get_option_chain(self, request: object) -> dict[str, SimpleNamespace]:
+        assert request is not None
+        return {}
+
+
+def query() -> OptionChainQuery:
+    return OptionChainQuery(
+        underlying_symbol="XYZ",
+        expiration_date_gte=date(2026, 9, 15),
+        expiration_date_lte=date(2026, 10, 15),
+    )
+
+
 @pytest.mark.asyncio
 async def test_alpaca_option_types_are_normalized_at_boundary() -> None:
     adapter = AlpacaOptionChainAdapter(
@@ -56,13 +70,7 @@ async def test_alpaca_option_types_are_normalized_at_boundary() -> None:
         trading_client=FakeTradingClient(),
         data_client=FakeDataClient(),
     )
-    result = await adapter.get_chain(
-        OptionChainQuery(
-            underlying_symbol="XYZ",
-            expiration_date_gte=date(2026, 9, 15),
-            expiration_date_lte=date(2026, 10, 15),
-        )
-    )
+    result, diagnostics = await adapter.get_chain_with_diagnostics(query())
 
     assert len(result) == 1
     assert isinstance(result[0], OptionContract)
@@ -71,3 +79,27 @@ async def test_alpaca_option_types_are_normalized_at_boundary() -> None:
     assert result[0].quote.open_interest == 900
     assert result[0].quote.greeks is not None
     assert result[0].quote.greeks.delta.as_tuple().exponent == -2
+    assert diagnostics.contract_definitions == 1
+    assert diagnostics.snapshots == 1
+    assert diagnostics.quoted_contracts == 1
+    assert diagnostics.missing_snapshots == 0
+    assert diagnostics.missing_quotes == 0
+
+
+@pytest.mark.asyncio
+async def test_chain_diagnostics_distinguish_missing_snapshot_from_empty_definitions() -> None:
+    adapter = AlpacaOptionChainAdapter(
+        "paper-key",
+        "paper-secret",
+        trading_client=FakeTradingClient(),
+        data_client=EmptyDataClient(),
+    )
+
+    result, diagnostics = await adapter.get_chain_with_diagnostics(query())
+
+    assert result == ()
+    assert diagnostics.contract_definitions == 1
+    assert diagnostics.snapshots == 0
+    assert diagnostics.quoted_contracts == 0
+    assert diagnostics.missing_snapshots == 1
+    assert diagnostics.missing_quotes == 0

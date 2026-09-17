@@ -6,7 +6,8 @@ import { FormEvent, useEffect, useState } from "react";
 
 import { deskFetch } from "@/lib/api";
 
-type Analysis = { opportunity_id: string; scan_run_id: string | null; symbol: string; disposition: string; source: string; observed_at: string; expires_at: string; signal: Record<string, unknown>; candidate: Record<string, unknown> | null; order_intent: Record<string, unknown> | null; reason_codes: string[] };
+type OptionDiagnostics = { total_contracts: number; requested_type_contracts: number; strict_eligible_contracts: number; selected_contracts: number; rejection_counts: Record<string, number> };
+type Analysis = { opportunity_id: string; scan_run_id: string | null; symbol: string; disposition: string; source: string; observed_at: string; expires_at: string; signal: Record<string, unknown>; candidate: Record<string, unknown> | null; order_intent: Record<string, unknown> | null; option_diagnostics: OptionDiagnostics | null; reason_codes: string[] };
 type Workspace = { scanner_enabled: boolean; watchlist_count: number; status: string };
 type ScanFailure = { symbol: string; code: "REAL_DATA_UNAVAILABLE" };
 type ScanResult = { scan_run_id: string; trigger: string; started_at: string; completed_at: string; attempted: number; results: Analysis[]; failures: ScanFailure[] };
@@ -172,7 +173,7 @@ export function MarketScanner() {
         <div>
           <strong>Regular Market Session is Currently Closed</strong>
           <p>
-            Connected Paper evaluates live Alpaca options chains with zero synthetic fallback. Outside regular U.S. trading hours (9:30 AM–4:00 PM ET), options quotes are stale or illiquid, causing candidates to report <code>UNAVAILABLE</code> or <code>NO TRADE</code>.
+            The scan now keeps plausible option structures for review even when quotes are stale. Those candidates are labeled execution-pending; fresh quotes and every risk gate are required again at the next U.S. session before any paper order.
           </p>
           <Link href="/demo">
             Try the Public Demo Workspace with interactive scenario replays →
@@ -186,7 +187,7 @@ export function MarketScanner() {
     <form className="watchlist-form" onSubmit={saveWatchlist}><label>Replace watchlist (comma or space separated)<input value={entry} onChange={(event) => setEntry(event.target.value)} placeholder={symbols.join(", ") || "SPY, QQQ, AAPL, MSFT"}/></label><button className="secondary-button">Save watchlist</button></form>
 
     <div className="scanner-results-layout">
-      <section className="data-table"><header><span>OPPORTUNITY</span><span>DISPOSITION / SCORE</span><span>SOURCE</span><span>OBSERVED</span><span>ACTION</span></header>{results.length === 0 ? <div className="table-empty"><Radar/><strong>No scan results yet</strong><p>Run a scan to evaluate your watchlist using verified real Alpaca data.</p></div> : results.map((result) => <div className="data-row" key={result.opportunity_id}><strong>{result.symbol}</strong><div><span className={`status-pill ${result.disposition === "TRADE" ? "good" : ""}`}>{result.disposition.replaceAll("_", " ")}</span><small style={{ display: "block", marginTop: "3px" }}>Score {scoreFor(result)}</small>{result.reason_codes.length ? <small style={{ display: "block", marginTop: "3px" }}>{result.reason_codes.join(", ")}</small> : null}</div><span>{result.source}</span><time>{easternDateTime.format(new Date(result.observed_at))}</time><Link href={`/desk/opportunities/${result.opportunity_id}`}>Review →</Link></div>)}</section>
+      <section className="data-table"><header><span>OPPORTUNITY</span><span>DISPOSITION / SCORE</span><span>SOURCE</span><span>OBSERVED</span><span>ACTION</span></header>{results.length === 0 ? <div className="table-empty"><Radar/><strong>No scan results yet</strong><p>Run a scan to evaluate your watchlist using verified real Alpaca data.</p></div> : results.map((result) => <div className="data-row" key={result.opportunity_id}><strong>{result.symbol}</strong><div><span className={`status-pill ${["TRADE", "PRE_SCAN_CANDIDATE"].includes(result.disposition) ? "good" : ""}`}>{result.disposition.replaceAll("_", " ")}</span><small style={{ display: "block", marginTop: "3px" }}>Score {scoreFor(result)}</small>{result.option_diagnostics ? <small style={{ display: "block", marginTop: "3px" }}>{result.option_diagnostics.selected_contracts} reviewable · {result.option_diagnostics.strict_eligible_contracts} executable now</small> : null}{result.reason_codes.length ? <small style={{ display: "block", marginTop: "3px" }}>{result.reason_codes.join(", ")}</small> : null}</div><span>{result.source}</span><time>{easternDateTime.format(new Date(result.observed_at))}</time><Link href={`/desk/opportunities/${result.opportunity_id}`}>Review →</Link></div>)}</section>
       <aside className="scan-history" aria-label="Scan history"><h2><History/>Scan history</h2>{runs.length === 0 ? <p>No completed scans.</p> : runs.slice(0, 5).map((run, index) => <button className={run.scan_run_id === selectedRunId ? "selected" : ""} disabled={historyBusy} key={run.scan_run_id} onClick={() => void selectRun(run)}><span>{index === 0 ? <b>Latest scan</b> : easternDateTime.format(new Date(run.started_at))}</span><strong>{run.completed} / {run.attempted}</strong><small>{run.failed ? `${run.failed} failed` : "all processed"}</small></button>)}</aside>
     </div>
     <button className="refresh-link" onClick={() => void refreshStoredResults()}><RefreshCw/>Refresh scan history</button>

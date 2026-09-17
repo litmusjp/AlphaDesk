@@ -20,6 +20,7 @@ from packages.connected.opportunities import (
     complete_scan_run,
     start_scan_run,
 )
+from packages.connected.option_scan_policy import ScanMode
 from packages.database.models import (
     WatchlistSymbolRecord,
     WorkspaceCredentialRecord,
@@ -272,7 +273,11 @@ async def _pre_session_supervisor(
                 dispositions: Counter[str] = Counter()
                 for symbol in symbols:
                     try:
-                        result = await service.analyze(symbol, scan_run_id=run.scan_run_id)
+                        result = await service.analyze(
+                            symbol,
+                            scan_run_id=run.scan_run_id,
+                            mode=ScanMode.PRE_SCAN,
+                        )
                         dispositions[result.disposition] += 1
                         completed_count += 1
                     except Exception as error:
@@ -364,7 +369,11 @@ async def _scanner_supervisor(
                 dispositions: Counter[str] = Counter()
                 for symbol in symbols:
                     try:
-                        result = await service.analyze(symbol, scan_run_id=run.scan_run_id)
+                        result = await service.analyze(
+                            symbol,
+                            scan_run_id=run.scan_run_id,
+                            mode=ScanMode.EXECUTION,
+                        )
                         dispositions[result.disposition] += 1
                         completed_count += 1
                     except Exception as error:

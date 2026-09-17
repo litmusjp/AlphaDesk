@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -15,13 +16,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.broker.reconciliation import BrokerExecutionGate
+from packages.connected.option_scan_policy import ScanMode, select_contracts
 from packages.database.models import ConnectedOpportunityRecord, ConnectedScanRunRecord
-from packages.domain.options import LegSide, LiquidityPolicy, OptionLeg, OptionType, StructureType
+from packages.domain.options import LegSide, OptionLeg, OptionType, StructureType
 from packages.domain.workflow import CatalystFeatures, NoTrade, Signal
 from packages.execution.intents import create_order_intent
-from packages.options.alpaca_adapter import AlpacaOptionChainAdapter, OptionChainQuery
+from packages.options.alpaca_adapter import (
+    AlpacaOptionChainAdapter,
+    OptionChainQuery,
+)
 from packages.options.engine import build_structure
-from packages.options.liquidity import evaluate_contract
 from packages.risk.engine import RiskContext, RiskEngine, RiskPolicy
 from packages.strategy.catalyst import CatalystMomentumStrategy, score_signal
 
@@ -60,6 +64,7 @@ class ConnectedAnalysis(BaseModel):
     candidate: dict[str, Any] | None = None
     risk_decision: dict[str, Any] | None = None
     order_intent: dict[str, Any] | None = None
+    option_diagnostics: dict[str, Any] | None = None
     reason_codes: tuple[str, ...] = ()
 
 
@@ -173,7 +178,13 @@ class ConnectedOpportunityService:
         )
         return features, price, now
 
-    async def analyze(self, symbol: str, *, scan_run_id: UUID | None = None) -> ConnectedAnalysis:
+    async def analyze(
+        self,
+        symbol: str,
+        *,
+        scan_run_id: UUID | None = None,
+        mode: ScanMode = ScanMode.EXECUTION,
+    ) -> ConnectedAnalysis:
         normalized = symbol.strip().upper()
         if not normalized.isalnum() or len(normalized) > 16:
             raise ValueError("Invalid symbol")
@@ -192,7 +203,9 @@ class ConnectedOpportunityService:
         strategy = CatalystMomentumStrategy()
         idea = strategy.evaluate_signal(signal)
         opportunity_id = uuid4()
-        expires_at = now + timedelta(minutes=2)
+        expires_at = now + (
+            timedelta(hours=18) if mode is ScanMode.PRE_SCAN else timedelta(minutes=2)
+        )
         if isinstance(idea, NoTrade):
             result = ConnectedAnalysis(
                 opportunity_id=opportunity_id,
@@ -207,7 +220,7 @@ class ConnectedOpportunityService:
             await self._persist(result)
             return result
 
-        contracts = await self._options.get_chain(
+        contracts, fetch_diagnostics = await self._options.get_chain_with_diagnostics(
             OptionChainQuery(
                 underlying_symbol=normalized,
                 expiration_date_gte=date.today() + timedelta(days=14),
@@ -217,22 +230,18 @@ class ConnectedOpportunityService:
             )
         )
         wanted_type = OptionType.CALL if idea.direction == "BULLISH" else OptionType.PUT
-        policy = LiquidityPolicy(
-            supported_underlyings=frozenset({normalized}),
-            min_dte=14,
-            max_dte=45,
-            max_spread_ratio=Decimal("0.20"),
-            min_open_interest=25,
-            max_quote_age_seconds=120,
+        selection = select_contracts(
+            tuple(contracts),
+            underlying_price=underlying_price,
+            wanted_type=wanted_type,
+            as_of=now,
+            mode=mode,
         )
-        eligible = [
-            contract
-            for contract in contracts
-            if contract.option_type is wanted_type
-            and evaluate_contract(
-                contract, underlying_price=underlying_price, policy=policy, as_of=now
-            ).eligible
-        ]
+        eligible = list(selection.selected)
+        option_diagnostics = {
+            **asdict(fetch_diagnostics),
+            **asdict(selection.diagnostics),
+        }
         expirations = sorted({item.expiration for item in eligible})
         if not expirations:
             return await self._unavailable(
@@ -242,6 +251,7 @@ class ConnectedOpportunityService:
                 now,
                 "no_eligible_option_chain",
                 scan_run_id=scan_run_id,
+                option_diagnostics=option_diagnostics,
             )
         selected = sorted(
             (item for item in eligible if item.expiration == expirations[0]),
@@ -255,6 +265,7 @@ class ConnectedOpportunityService:
                 now,
                 "insufficient_vertical_legs",
                 scan_run_id=scan_run_id,
+                option_diagnostics=option_diagnostics,
             )
         if wanted_type is OptionType.CALL:
             long_index = min(
@@ -272,19 +283,32 @@ class ConnectedOpportunityService:
                 long_index = 1
             long_contract, short_contract = selected[long_index], selected[long_index - 1]
             structure_type = StructureType.BEAR_PUT_DEBIT_SPREAD
-        structure = build_structure(
-            structure_type,
-            (
-                OptionLeg(
-                    side=LegSide.LONG, contract=long_contract, entry_price=long_contract.quote.ask
+        try:
+            structure = build_structure(
+                structure_type,
+                (
+                    OptionLeg(
+                        side=LegSide.LONG,
+                        contract=long_contract,
+                        entry_price=long_contract.quote.ask,
+                    ),
+                    OptionLeg(
+                        side=LegSide.SHORT,
+                        contract=short_contract,
+                        entry_price=short_contract.quote.bid,
+                    ),
                 ),
-                OptionLeg(
-                    side=LegSide.SHORT,
-                    contract=short_contract,
-                    entry_price=short_contract.quote.bid,
-                ),
-            ),
-        )
+            )
+        except ValueError:
+            return await self._unavailable(
+                opportunity_id,
+                signal,
+                idea,
+                now,
+                "invalid_option_structure",
+                scan_run_id=scan_run_id,
+                option_diagnostics=option_diagnostics,
+            )
         candidate = strategy.rank_candidates(idea, (structure,))[0]
         projections = PostgresBrokerProjectionStore(self._sessions, self._workspace_id)
         account = await projections.get_account()
@@ -316,11 +340,16 @@ class ConnectedOpportunityService:
             ),
         )
         intent = create_order_intent(risk, candidate) if risk.decision == "APPROVE" else None
+        pre_scan = mode is ScanMode.PRE_SCAN
         result = ConnectedAnalysis(
             opportunity_id=opportunity_id,
             scan_run_id=scan_run_id,
             symbol=normalized,
-            disposition="TRADE" if intent else "RISK_REJECTED",
+            disposition=(
+                ("PRE_SCAN_CANDIDATE" if pre_scan else "TRADE")
+                if intent
+                else "RISK_REJECTED"
+            ),
             observed_at=now,
             expires_at=expires_at,
             signal=signal.model_dump(mode="json"),
@@ -328,6 +357,8 @@ class ConnectedOpportunityService:
             candidate=candidate.model_dump(mode="json"),
             risk_decision=risk.model_dump(mode="json"),
             order_intent=None if intent is None else intent.model_dump(mode="json"),
+            option_diagnostics=option_diagnostics,
+            reason_codes=("execution_validation_pending",) if pre_scan and intent else (),
         )
         await self._persist(result)
         return result
@@ -341,6 +372,7 @@ class ConnectedOpportunityService:
         reason: str,
         *,
         scan_run_id: UUID | None = None,
+        option_diagnostics: dict[str, Any] | None = None,
     ) -> ConnectedAnalysis:
         result = ConnectedAnalysis(
             opportunity_id=opportunity_id,
@@ -351,6 +383,7 @@ class ConnectedOpportunityService:
             expires_at=now + timedelta(minutes=2),
             signal=signal.model_dump(mode="json"),
             trade_idea=idea.model_dump(mode="json"),
+            option_diagnostics=option_diagnostics,
             reason_codes=(reason,),
         )
         await self._persist(result)

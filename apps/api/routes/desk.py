@@ -28,6 +28,7 @@ from packages.connected.opportunities import (
     complete_scan_run,
     start_scan_run,
 )
+from packages.connected.option_scan_policy import ScanMode
 from packages.database.models import (
     AuditRecord,
     BrokerAccountRecord,
@@ -612,14 +613,32 @@ async def market_clock(
         ) from error
 
 
+async def _resolve_scan_mode(
+    request: Request,
+    context: WorkspaceContext,
+    requested: Literal["AUTO", "PRE_SCAN", "EXECUTION"],
+) -> ScanMode:
+    if requested == "PRE_SCAN":
+        return ScanMode.PRE_SCAN
+    if requested == "EXECUTION":
+        return ScanMode.EXECUTION
+    try:
+        clock = await market_clock(request, context)
+    except HTTPException:
+        return ScanMode.EXECUTION
+    return ScanMode.EXECUTION if clock.is_open else ScanMode.PRE_SCAN
+
+
 @router.post("/opportunities/analyze/{symbol}", response_model=ConnectedAnalysis)
 async def analyze_symbol(
     symbol: str,
     request: Request,
+    scan_mode: Literal["AUTO", "PRE_SCAN", "EXECUTION"] = "AUTO",
     context: WorkspaceContext = Depends(require_workspace),
 ) -> ConnectedAnalysis:
     try:
-        return await (await _opportunity_service(request, context)).analyze(symbol)
+        mode = await _resolve_scan_mode(request, context, scan_mode)
+        return await (await _opportunity_service(request, context)).analyze(symbol, mode=mode)
     except HTTPException:
         raise
     except Exception as error:
@@ -631,7 +650,9 @@ async def analyze_symbol(
 
 @router.post("/scanner/scan", response_model=ScannerResult)
 async def scan_now(
-    request: Request, context: WorkspaceContext = Depends(require_workspace)
+    request: Request,
+    scan_mode: Literal["AUTO", "PRE_SCAN", "EXECUTION"] = "AUTO",
+    context: WorkspaceContext = Depends(require_workspace),
 ) -> ScannerResult:
     async with request.app.state.database.sessions() as session:
         symbols = list(
@@ -642,6 +663,7 @@ async def scan_now(
             )
         )
     service = await _opportunity_service(request, context)
+    mode = await _resolve_scan_mode(request, context, scan_mode)
     run = await start_scan_run(
         request.app.state.database.sessions,
         context.workspace_id,
@@ -652,7 +674,9 @@ async def scan_now(
     failures: list[ScannerFailure] = []
     for symbol in symbols:
         try:
-            results.append(await service.analyze(symbol, scan_run_id=run.scan_run_id))
+            results.append(
+                await service.analyze(symbol, scan_run_id=run.scan_run_id, mode=mode)
+            )
         except Exception as error:
             logger.warning(
                 "workspace_scan_symbol_unavailable",
@@ -847,8 +871,14 @@ async def approve_for_next_session(
         if opportunity_record is None:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         opportunity = ConnectedAnalysis.model_validate(opportunity_record.payload)
-        if opportunity.source != "ALPACA_REAL" or opportunity.disposition != "TRADE":
-            raise HTTPException(status_code=409, detail="Only TRADE opportunities can be approved")
+        if opportunity.source != "ALPACA_REAL" or opportunity.disposition not in {
+            "TRADE",
+            "PRE_SCAN_CANDIDATE",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail="Only executable or pre-scan candidate opportunities can be approved",
+            )
         if opportunity.order_intent is None or opportunity.candidate is None:
             raise HTTPException(status_code=409, detail="Opportunity has no immutable order intent")
         intent = OrderIntent.model_validate(opportunity.order_intent)
