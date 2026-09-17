@@ -4,10 +4,11 @@ from __future__ import annotations
 # ruff: noqa: B008
 import asyncio
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from alpaca.common.exceptions import APIError
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -20,7 +21,6 @@ from packages.ai.workflow import AIWorkflow
 from packages.auth.dependencies import WorkspaceContext, require_workspace
 from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
-from packages.broker.reconciliation import BrokerExecutionGate
 from packages.connected.market_clock import AlpacaMarketClockAdapter, ConnectedMarketClock
 from packages.connected.opportunities import (
     ConnectedAnalysis,
@@ -29,10 +29,12 @@ from packages.connected.opportunities import (
     start_scan_run,
 )
 from packages.database.models import (
+    AuditRecord,
     BrokerAccountRecord,
     BrokerOrderRecord,
     BrokerPositionRecord,
     BrokerSyncStateRecord,
+    ConditionalApprovalRecord,
     ConnectedOpportunityRecord,
     ConnectedScanRunRecord,
     GuardianIncidentRecord,
@@ -45,12 +47,13 @@ from packages.domain.broker import BrokerAccount, BrokerOrder, BrokerPosition, B
 from packages.domain.guardian import GuardianStatus, GuardianTrigger
 from packages.domain.system import BrokerState
 from packages.domain.workflow import OrderIntent, RankedCandidate
-from packages.execution.engine import ExecutionBlocked, ExecutionEngine
-from packages.execution.store import PostgresIntentStore
-from packages.guardian.gate import GuardianExecutionGate
+from packages.execution.conditional_approval import (
+    ApprovalState,
+    order_structure_fingerprint,
+)
+from packages.execution.connected_paper import execute_connected_paper_order
 from packages.guardian.store import PostgresGuardianStore
 from packages.observability.logging import get_logger
-from packages.risk.engine import RiskContext, RiskEngine, RiskPolicy
 from packages.security.store import CredentialStore
 
 router = APIRouter(prefix="/desk", tags=["connected-paper"])
@@ -169,17 +172,33 @@ class ConfirmPaperOrder(BaseModel):
     client_order_id: str = Field(min_length=10, max_length=64)
 
 
-class ConnectedPreflight:
-    def __init__(self, broker: BrokerExecutionGate, guardian: GuardianExecutionGate) -> None:
-        self._broker = broker
-        self._guardian = guardian
+class ConditionalApprovalInput(BaseModel):
+    model_config = ConfigDict(frozen=True)
 
-    async def execution_allowed(self) -> tuple[bool, str]:
-        guardian_allowed, guardian_reason = await self._guardian.execution_allowed()
-        if not guardian_allowed:
-            return False, guardian_reason
-        broker = await self._broker.evaluate()
-        return broker.allowed, broker.reason
+    max_limit_price: Decimal | None = Field(default=None, gt=0)
+    max_loss: Decimal | None = Field(default=None, gt=0)
+    max_quantity: int | None = Field(default=None, ge=1, le=100)
+    max_quote_age_seconds: int = Field(default=30, ge=1, le=300)
+
+
+class ConditionalApprovalView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    approval_id: UUID
+    opportunity_id: UUID
+    symbol: str
+    state: str
+    session_date: date
+    approved_at: datetime
+    expires_at: datetime
+    client_order_id: str
+    structure_fingerprint: str
+    max_limit_price: Decimal
+    max_loss: Decimal
+    max_quantity: int
+    max_quote_age_seconds: int
+    broker_order_id: str | None
+    failure_reason: str | None
 
 
 def _credential_store(request: Request) -> CredentialStore:
@@ -214,6 +233,28 @@ def _credential_view(
         configuration=record.configuration,
         validated_at=record.validated_at,
         updated_at=record.updated_at,
+    )
+
+
+def _conditional_approval_view(
+    record: ConditionalApprovalRecord, symbol: str
+) -> ConditionalApprovalView:
+    return ConditionalApprovalView(
+        approval_id=record.approval_id,
+        opportunity_id=record.opportunity_id,
+        symbol=symbol,
+        state=record.state,
+        session_date=record.session_date,
+        approved_at=record.approved_at,
+        expires_at=record.expires_at,
+        client_order_id=record.client_order_id,
+        structure_fingerprint=record.structure_fingerprint,
+        max_limit_price=record.max_limit_price,
+        max_loss=record.max_loss,
+        max_quantity=record.max_quantity,
+        max_quote_age_seconds=record.max_quote_age_seconds,
+        broker_order_id=record.broker_order_id,
+        failure_reason=record.failure_reason,
     )
 
 
@@ -744,6 +785,181 @@ async def get_opportunity(
     return ConnectedAnalysis.model_validate(record.payload)
 
 
+async def _next_session_window(
+    request: Request, context: WorkspaceContext
+) -> tuple[date, datetime]:
+    secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
+    if secrets is None:
+        raise HTTPException(status_code=409, detail="Verified Alpaca paper credentials required")
+    adapter = AlpacaMarketClockAdapter(str(secrets["api_key_id"]), str(secrets["secret_key"]))
+    try:
+        clock = await adapter.get_clock()
+    except Exception as error:
+        raise HTTPException(status_code=422, detail="Market calendar unavailable") from error
+    eastern = ZoneInfo("America/New_York")
+    session_date = clock.next_open.astimezone(eastern).date()
+    expires_at = clock.next_close + timedelta(minutes=5)
+    if expires_at.astimezone(eastern).date() != session_date:
+        expires_at = clock.next_open + timedelta(hours=7)
+    return session_date, expires_at
+
+
+@router.get("/approvals", response_model=list[ConditionalApprovalView])
+async def list_conditional_approvals(
+    request: Request, context: WorkspaceContext = Depends(require_workspace)
+) -> list[ConditionalApprovalView]:
+    async with request.app.state.database.sessions() as session:
+        rows = list(
+            await session.execute(
+                select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
+                .join(
+                    ConnectedOpportunityRecord,
+                    ConnectedOpportunityRecord.opportunity_id
+                    == ConditionalApprovalRecord.opportunity_id,
+                )
+                .where(ConditionalApprovalRecord.workspace_id == context.workspace_id)
+                .order_by(ConditionalApprovalRecord.created_at.desc())
+                .limit(50)
+            )
+        )
+    return [_conditional_approval_view(record, symbol) for record, symbol in rows]
+
+
+@router.post(
+    "/opportunities/{opportunity_id}/approve-session",
+    response_model=ConditionalApprovalView,
+)
+async def approve_for_next_session(
+    opportunity_id: UUID,
+    payload: ConditionalApprovalInput,
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> ConditionalApprovalView:
+    session_date, expires_at = await _next_session_window(request, context)
+    now = datetime.now(UTC)
+    async with request.app.state.database.sessions.begin() as session:
+        opportunity_record = await session.scalar(
+            select(ConnectedOpportunityRecord).where(
+                ConnectedOpportunityRecord.workspace_id == context.workspace_id,
+                ConnectedOpportunityRecord.opportunity_id == opportunity_id,
+            )
+        )
+        if opportunity_record is None:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        opportunity = ConnectedAnalysis.model_validate(opportunity_record.payload)
+        if opportunity.source != "ALPACA_REAL" or opportunity.disposition != "TRADE":
+            raise HTTPException(status_code=409, detail="Only TRADE opportunities can be approved")
+        if opportunity.order_intent is None or opportunity.candidate is None:
+            raise HTTPException(status_code=409, detail="Opportunity has no immutable order intent")
+        intent = OrderIntent.model_validate(opportunity.order_intent)
+        candidate = RankedCandidate.model_validate(opportunity.candidate)
+        max_limit_price = payload.max_limit_price or intent.limit_price
+        max_loss = payload.max_loss or candidate.structure.max_loss
+        max_quantity = payload.max_quantity or intent.quantity
+        if max_limit_price < intent.limit_price:
+            raise HTTPException(status_code=422, detail="Maximum price is below the approved limit")
+        if max_loss < candidate.structure.max_loss:
+            raise HTTPException(status_code=422, detail="Maximum loss is below the candidate risk")
+        if max_quantity < intent.quantity:
+            raise HTTPException(
+                status_code=422, detail="Maximum quantity is below the candidate quantity"
+            )
+        existing = await session.scalar(
+            select(ConditionalApprovalRecord).where(
+                ConditionalApprovalRecord.workspace_id == context.workspace_id,
+                ConditionalApprovalRecord.opportunity_id == opportunity_id,
+                ConditionalApprovalRecord.state.in_(
+                    (ApprovalState.APPROVED_FOR_SESSION, "REVALIDATING")
+                ),
+            )
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=409, detail="Opportunity already has an active approval"
+            )
+        record = ConditionalApprovalRecord(
+            approval_id=uuid4(),
+            workspace_id=context.workspace_id,
+            opportunity_id=opportunity_id,
+            approved_by_user_id=context.principal.user_id,
+            state=ApprovalState.APPROVED_FOR_SESSION,
+            session_date=session_date,
+            approved_at=now,
+            expires_at=expires_at,
+            client_order_id=intent.client_order_id,
+            structure_fingerprint=order_structure_fingerprint(intent),
+            max_limit_price=max_limit_price,
+            max_loss=max_loss,
+            max_quantity=max_quantity,
+            max_quote_age_seconds=payload.max_quote_age_seconds,
+            broker_order_id=None,
+            failure_reason=None,
+            claimed_at=None,
+            submitted_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(record)
+        session.add(
+            AuditRecord(
+                audit_id=uuid4(),
+                workspace_id=context.workspace_id,
+                actor_user_id=context.principal.user_id,
+                action="CONDITIONAL_APPROVAL_CREATED",
+                detail={
+                    "approval_id": str(record.approval_id),
+                    "opportunity_id": str(opportunity_id),
+                    "session_date": session_date.isoformat(),
+                },
+                occurred_at=now,
+            )
+        )
+        return _conditional_approval_view(record, opportunity.symbol)
+
+
+@router.post("/approvals/{approval_id}/reject", response_model=ConditionalApprovalView)
+async def reject_conditional_approval(
+    approval_id: UUID,
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> ConditionalApprovalView:
+    now = datetime.now(UTC)
+    async with request.app.state.database.sessions.begin() as session:
+        row = await session.execute(
+            select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
+            .join(
+                ConnectedOpportunityRecord,
+                ConnectedOpportunityRecord.opportunity_id
+                == ConditionalApprovalRecord.opportunity_id,
+            )
+            .where(
+                ConditionalApprovalRecord.workspace_id == context.workspace_id,
+                ConditionalApprovalRecord.approval_id == approval_id,
+            )
+            .with_for_update()
+        )
+        result = row.first()
+        if result is None:
+            raise HTTPException(status_code=404, detail="Approval not found")
+        record, symbol = result
+        if record.state in (ApprovalState.SUBMITTED, "FILLED"):
+            raise HTTPException(status_code=409, detail="Submitted approvals cannot be rejected")
+        record.state = ApprovalState.REJECTED
+        record.failure_reason = "operator_rejected"
+        record.updated_at = now
+        session.add(
+            AuditRecord(
+                audit_id=uuid4(),
+                workspace_id=context.workspace_id,
+                actor_user_id=context.principal.user_id,
+                action="CONDITIONAL_APPROVAL_REJECTED",
+                detail={"approval_id": str(record.approval_id)},
+                occurred_at=now,
+            )
+        )
+        return _conditional_approval_view(record, symbol)
+
+
 @router.post("/opportunities/{opportunity_id}/ai", response_model=AIWorkflowResult)
 async def analyze_opportunity_with_ai(
     opportunity_id: UUID,
@@ -845,48 +1061,21 @@ async def confirm_paper_order(
         )
     assert opportunity.candidate is not None
     candidate = RankedCandidate.model_validate(opportunity.candidate)
-    projections = _broker_store(request, context)
-    account = await projections.get_account()
-    if account is None:
-        raise HTTPException(status_code=409, detail="Broker account projection unavailable")
-    positions = await projections.list_positions()
-    gate = await BrokerExecutionGate(projections).evaluate()
-    rerisk = RiskEngine(RiskPolicy()).evaluate(
-        candidate,
-        RiskContext(
-            paper_equity=account.equity,
-            open_planned_loss=0,
-            underlying_open_risk=0,
-            daily_loss=max(account.last_equity - account.equity, Decimal("0")),
-            drawdown_percent=max(account.last_equity - account.equity, Decimal("0"))
-            / max(account.last_equity, Decimal("1"))
-            * Decimal("100"),
-            concurrent_option_structures=len(positions),
-            broker_execution_allowed=gate.allowed,
-        ),
-    )
-    if rerisk.decision != "APPROVE":
+    cipher = request.app.state.credential_cipher
+    if cipher is None:
         raise HTTPException(
-            status_code=409, detail="Deterministic risk no longer approves this order"
+            status_code=503, detail="Encrypted credential storage is not configured"
         )
-    secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
-    if secrets is None:
-        raise HTTPException(status_code=409, detail="Alpaca credential unavailable")
-    adapter = AlpacaPaperBrokerAdapter(str(secrets["api_key_id"]), str(secrets["secret_key"]))
-    guardian = PostgresGuardianStore(request.app.state.database.sessions, context.workspace_id)
-    engine = ExecutionEngine(
-        adapter,
-        PostgresIntentStore(request.app.state.database.sessions, context.workspace_id),
-        preflight=ConnectedPreflight(
-            BrokerExecutionGate(projections), GuardianExecutionGate(guardian)
-        ),
-    )
     try:
-        return await engine.execute(intent)
-    except ExecutionBlocked as error:
+        return await execute_connected_paper_order(
+            database=request.app.state.database,
+            cipher=cipher,
+            workspace_id=context.workspace_id,
+            candidate=candidate,
+            intent=intent,
+        )
+    except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
-    finally:
-        await adapter.close()
 
 
 def _broker_store(request: Request, context: WorkspaceContext) -> PostgresBrokerProjectionStore:

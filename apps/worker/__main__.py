@@ -4,7 +4,7 @@ import asyncio
 import signal
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -14,6 +14,7 @@ from packages.broker.alpaca_adapter import AlpacaPaperBrokerAdapter
 from packages.broker.projections import PostgresBrokerProjectionStore
 from packages.broker.reconciliation import ReconciliationService
 from packages.configuration.settings import get_settings
+from packages.connected.market_clock import AlpacaMarketClockAdapter
 from packages.connected.opportunities import (
     ConnectedOpportunityService,
     complete_scan_run,
@@ -26,6 +27,7 @@ from packages.database.models import (
 )
 from packages.database.session import Database
 from packages.event_bus.client import JetStreamEventBus
+from packages.execution.conditional_runner import process_workspace_approvals
 from packages.observability.logging import configure_logging, get_logger
 from packages.security.credentials import CredentialCipher, CredentialConfigurationError
 from packages.security.store import CredentialStore
@@ -196,6 +198,118 @@ def _market_is_open(now: datetime) -> bool:
     return eastern.weekday() < 5 and 570 <= minutes < 960
 
 
+async def _alpaca_market_is_open(
+    credential_store: CredentialStore, workspace_id: UUID
+) -> bool:
+    secret = await credential_store.reveal(workspace_id, "ALPACA")
+    if secret is None:
+        return False
+    try:
+        clock = await AlpacaMarketClockAdapter(
+            str(secret["api_key_id"]), str(secret["secret_key"])
+        ).get_clock()
+    except Exception:
+        logger.warning(
+            "workspace_market_clock_unavailable",
+            extra={
+                "event": "workspace_market_clock_unavailable",
+                "workspace_id": str(workspace_id),
+            },
+        )
+        return False
+    return bool(clock.is_open)
+
+
+async def _pre_session_supervisor(
+    database: Database,
+    cipher: CredentialCipher,
+    stop: asyncio.Event,
+) -> None:
+    last_pre_scans: dict[UUID, date] = {}
+    credential_store = CredentialStore(database.sessions, cipher)
+    japan = ZoneInfo("Asia/Tokyo")
+    while not stop.is_set():
+        now = datetime.now(UTC)
+        local = now.astimezone(japan)
+        if local.weekday() < 5 and 20 <= local.hour < 22:
+            async with database.sessions() as session:
+                workspaces = list(
+                    await session.scalars(
+                        select(WorkspaceRecord).where(
+                            WorkspaceRecord.scanner_enabled.is_(True),
+                            WorkspaceRecord.status == "ACTIVE",
+                        )
+                    )
+                )
+            for workspace in workspaces:
+                if last_pre_scans.get(workspace.workspace_id) == local.date():
+                    continue
+                secret = await credential_store.reveal(workspace.workspace_id, "ALPACA")
+                if secret is None:
+                    continue
+                async with database.sessions() as session:
+                    symbols = list(
+                        await session.scalars(
+                            select(WatchlistSymbolRecord.symbol).where(
+                                WatchlistSymbolRecord.workspace_id == workspace.workspace_id
+                            )
+                        )
+                    )
+                service = ConnectedOpportunityService(
+                    database.sessions,
+                    workspace.workspace_id,
+                    str(secret["api_key_id"]),
+                    str(secret["secret_key"]),
+                )
+                run = await start_scan_run(
+                    database.sessions,
+                    workspace.workspace_id,
+                    trigger="PRE_SESSION",
+                    attempted_count=len(symbols),
+                )
+                completed_count = 0
+                failed_count = 0
+                dispositions: Counter[str] = Counter()
+                for symbol in symbols:
+                    try:
+                        result = await service.analyze(symbol, scan_run_id=run.scan_run_id)
+                        dispositions[result.disposition] += 1
+                        completed_count += 1
+                    except Exception as error:
+                        failed_count += 1
+                        logger.warning(
+                            "workspace_pre_scan_symbol_unavailable",
+                            extra={
+                                "event": "workspace_pre_scan_symbol_unavailable",
+                                "workspace_id": str(workspace.workspace_id),
+                                "symbol": symbol,
+                                "failure_type": type(error).__name__,
+                            },
+                        )
+                await complete_scan_run(
+                    database.sessions,
+                    run.scan_run_id,
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                )
+                last_pre_scans[workspace.workspace_id] = local.date()
+                logger.info(
+                    "workspace_pre_scan_completed",
+                    extra={
+                        "event": "workspace_pre_scan_completed",
+                        "workspace_id": str(workspace.workspace_id),
+                        "scan_run_id": str(run.scan_run_id),
+                        "trigger": run.trigger,
+                        "attempted": len(symbols),
+                        "completed": completed_count,
+                        "failed": failed_count,
+                        "dispositions": dict(dispositions),
+                        "japan_date": local.date().isoformat(),
+                    },
+                )
+        await _wait_or_stop(stop, 60)
+
+
 async def _scanner_supervisor(
     database: Database,
     cipher: CredentialCipher,
@@ -210,12 +324,15 @@ async def _scanner_supervisor(
                 workspaces = list(
                     await session.scalars(
                         select(WorkspaceRecord).where(
-                            WorkspaceRecord.scanner_enabled.is_(True),
                             WorkspaceRecord.status == "ACTIVE",
                         )
                     )
                 )
             for workspace in workspaces:
+                if not await _alpaca_market_is_open(credential_store, workspace.workspace_id):
+                    continue
+                if not workspace.scanner_enabled:
+                    continue
                 last = last_scans.get(workspace.workspace_id)
                 if last is not None and now - last < timedelta(minutes=5):
                     continue
@@ -281,6 +398,15 @@ async def _scanner_supervisor(
                     },
                 )
                 last_scans[workspace.workspace_id] = now
+            for workspace in workspaces:
+                if not await _alpaca_market_is_open(credential_store, workspace.workspace_id):
+                    continue
+                await process_workspace_approvals(
+                    database=database,
+                    cipher=cipher,
+                    workspace_id=workspace.workspace_id,
+                    now=now,
+                )
         await _wait_or_stop(stop, 30)
 
 
@@ -325,6 +451,7 @@ async def run() -> None:
                 connection_limit=settings.workspace_connection_limit,
             ),
             _scanner_supervisor(database, cipher, stop),
+            _pre_session_supervisor(database, cipher, stop),
         )
     finally:
         await event_bus.close()

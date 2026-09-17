@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import Decimal
+from enum import StrEnum
+from uuid import UUID
+
+from packages.domain.workflow import OrderIntent
+
+
+class ApprovalState(StrEnum):
+    APPROVED_FOR_SESSION = "APPROVED_FOR_SESSION"
+    REVALIDATING = "REVALIDATING"
+    READY_TO_SUBMIT = "READY_TO_SUBMIT"
+    SUBMITTED = "SUBMITTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    SUBMISSION_UNCERTAIN = "SUBMISSION_UNCERTAIN"
+    BROKER_REJECTED = "BROKER_REJECTED"
+    CONDITION_FAILED = "CONDITION_FAILED"
+    EXPIRED = "EXPIRED"
+    REJECTED = "REJECTED"
+
+
+class RevalidationDecision(StrEnum):
+    READY_TO_SUBMIT = "READY_TO_SUBMIT"
+    CONDITION_FAILED = "CONDITION_FAILED"
+    EXPIRED = "EXPIRED"
+
+
+@dataclass(frozen=True)
+class ConditionalApproval:
+    approval_id: UUID
+    workspace_id: UUID
+    opportunity_id: UUID
+    client_order_id: str
+    session_date: date
+    approved_at: datetime
+    expires_at: datetime
+    structure_fingerprint: str
+    max_limit_price: Decimal
+    max_loss: Decimal
+    max_quantity: int
+    max_quote_age_seconds: int
+    state: ApprovalState
+
+
+@dataclass(frozen=True)
+class RevalidationResult:
+    decision: RevalidationDecision
+    reason: str | None = None
+
+
+def order_structure_fingerprint(intent: OrderIntent) -> str:
+    return "|".join(f"{leg.symbol}:{leg.side}:{leg.ratio}" for leg in intent.legs)
+
+
+def _invalid_decimal(value: Decimal) -> bool:
+    return not value.is_finite() or value < 0
+
+
+def revalidate_for_submission(
+    approval: ConditionalApproval,
+    *,
+    now: datetime,
+    session_date: date,
+    structure_fingerprint: str,
+    limit_price: Decimal,
+    maximum_loss: Decimal,
+    quantity: int,
+    quote_age_seconds: int,
+) -> RevalidationResult:
+    if approval.state is not ApprovalState.APPROVED_FOR_SESSION:
+        return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "approval_not_pending")
+    if session_date != approval.session_date or now >= approval.expires_at:
+        return RevalidationResult(RevalidationDecision.EXPIRED, "approval_session_mismatch")
+    if structure_fingerprint != approval.structure_fingerprint:
+        return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "structure_changed")
+    if quantity < 1 or quantity > approval.max_quantity:
+        return RevalidationResult(
+            RevalidationDecision.CONDITION_FAILED, "quantity_exceeds_approval"
+        )
+    if quote_age_seconds < 0 or quote_age_seconds > approval.max_quote_age_seconds:
+        return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "quote_stale")
+    if _invalid_decimal(limit_price) or limit_price > approval.max_limit_price:
+        return RevalidationResult(
+            RevalidationDecision.CONDITION_FAILED, "limit_price_exceeds_approval"
+        )
+    if _invalid_decimal(maximum_loss) or maximum_loss > approval.max_loss:
+        return RevalidationResult(
+            RevalidationDecision.CONDITION_FAILED, "maximum_loss_exceeds_approval"
+        )
+    return RevalidationResult(RevalidationDecision.READY_TO_SUBMIT)
