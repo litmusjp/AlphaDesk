@@ -30,6 +30,11 @@ type Position = {
   current_price?: string | null;
 };
 
+type CloseAction = {
+  symbol: string;
+  mode: "choose" | "now" | "next-session";
+};
+
 type Order = {
   broker_order_id: string;
   client_order_id: string;
@@ -64,7 +69,7 @@ export function DeskPositions() {
     broker: Broker;
   } | null>(null);
   const [error, setError] = useState("");
-  const [closingSymbol, setClosingSymbol] = useState<string | null>(null);
+  const [closeAction, setCloseAction] = useState<CloseAction | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionMessage, setActionMessage] = useState<{
     type: "success" | "error";
@@ -102,7 +107,7 @@ export function DeskPositions() {
         type: "success",
         text: `Closing order for ${symbol} routed to Alpaca paper matching engine.`,
       });
-      setClosingSymbol(null);
+      setCloseAction(null);
       await refreshData();
     } catch (e) {
       setActionMessage({
@@ -127,6 +132,7 @@ export function DeskPositions() {
         type: "success",
         text: `Bounded close approval created for ${position.symbol}. Review it in Pre-approved; no order was submitted.`,
       });
+      setCloseAction(null);
     } catch (e) {
       setActionMessage({
         type: "error",
@@ -230,7 +236,8 @@ export function DeskPositions() {
             const { root, isOption, expiry, type, strike } = parseOptionSymbol(p.symbol);
             const unrealized = Number(p.unrealized_pl);
             const isPositive = unrealized >= 0;
-            const isClosing = closingSymbol === p.symbol;
+            const isSelected = closeAction?.symbol === p.symbol;
+            const selectedMode = isSelected ? closeAction.mode : null;
 
             return (
               <div
@@ -274,52 +281,96 @@ export function DeskPositions() {
                 </div>
                 <span className="status-pill good">RECONCILED</span>
                 <div>
-                  {isClosing ? (
-                    <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                      <button
-                        className="danger-button"
-                        style={{ fontSize: "11px", padding: "4px 8px" }}
-                        disabled={busy}
-                        onClick={() => handleClosePosition(p.symbol)}
-                      >
-                        {busy ? "Closing…" : "Confirm"}
-                      </button>
-                      <button
-                        className="secondary-button"
-                        style={{ fontSize: "11px", padding: "4px 8px" }}
-                        disabled={busy}
-                        onClick={() => setClosingSymbol(null)}
-                      >
-                        Cancel
-                      </button>
-                    </div>
+                  {isSelected ? (
+                    selectedMode === "choose" ? (
+                      <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+                        <span style={{ fontSize: "10px", color: "#5a6864" }}>Close position:</span>
+                        <div style={{ display: "flex", gap: "5px" }}>
+                          <button
+                            className="danger-button"
+                            style={{ fontSize: "11px", padding: "4px 8px" }}
+                            disabled={busy}
+                            onClick={() => setCloseAction({ symbol: p.symbol, mode: "now" })}
+                          >
+                            Now
+                          </button>
+                          <button
+                            className="secondary-button"
+                            style={{ fontSize: "10px", padding: "4px 7px" }}
+                            disabled={busy}
+                            onClick={() => setCloseAction({ symbol: p.symbol, mode: "next-session" })}
+                          >
+                            Pre-approve next session
+                          </button>
+                        </div>
+                        <button
+                          className="secondary-button"
+                          style={{ fontSize: "10px", padding: "3px 7px", alignSelf: "flex-start" }}
+                          disabled={busy}
+                          onClick={() => setCloseAction(null)}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : selectedMode === "now" ? (
+                      <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                        <button
+                          className="danger-button"
+                          style={{ fontSize: "11px", padding: "4px 8px" }}
+                          disabled={busy}
+                          onClick={() => handleClosePosition(p.symbol)}
+                        >
+                          {busy ? "Closing…" : "Confirm"}
+                        </button>
+                        <button
+                          className="secondary-button"
+                          style={{ fontSize: "11px", padding: "4px 8px" }}
+                          disabled={busy}
+                          onClick={() => setCloseAction(null)}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+                        <span style={{ fontSize: "10px", color: "#5a6864" }}>Pre-approve next session?</span>
+                        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                          <button
+                            className="secondary-button"
+                            style={{ fontSize: "10px", padding: "4px 7px" }}
+                            disabled={busy}
+                            onClick={() => handleApproveClose(p)}
+                          >
+                            {busy ? "Approving…" : "Confirm"}
+                          </button>
+                          <button
+                            className="secondary-button"
+                            style={{ fontSize: "10px", padding: "4px 7px" }}
+                            disabled={busy}
+                            onClick={() => setCloseAction(null)}
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )
                   ) : (
-                    <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
-                      <button
-                        className="secondary-button"
-                        style={{
-                          color: "#a8372c",
-                          borderColor: "#f3c2be",
-                          fontSize: "11px",
-                          padding: "4px 10px",
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "4px",
-                        }}
-                        onClick={() => setClosingSymbol(p.symbol)}
-                      >
-                        <LogOut size={12} />
-                        Close Position
-                      </button>
-                      <button
-                        className="secondary-button"
-                        style={{ fontSize: "10px", padding: "4px 7px" }}
-                        disabled={busy}
-                        onClick={() => handleApproveClose(p)}
-                      >
-                        {busy ? "Approving…" : "Pre-approve next session"}
-                      </button>
-                    </div>
+                    <button
+                      className="secondary-button"
+                      style={{
+                        color: "#a8372c",
+                        borderColor: "#f3c2be",
+                        fontSize: "11px",
+                        padding: "4px 10px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "4px",
+                      }}
+                      onClick={() => setCloseAction({ symbol: p.symbol, mode: "choose" })}
+                    >
+                      <LogOut size={12} />
+                      Close position
+                    </button>
                   )}
                 </div>
               </div>
