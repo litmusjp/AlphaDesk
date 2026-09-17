@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +45,18 @@ class FakeDataClient:
                 ),
                 implied_volatility=0.24,
                 greeks=SimpleNamespace(delta=0.52, gamma=0.04, theta=-0.03, vega=0.15),
+            )
+        }
+
+    def get_option_latest_quote(self, request: object) -> dict[str, SimpleNamespace]:
+        assert request is not None
+        return {
+            "XYZ260925C00100000": SimpleNamespace(
+                bid_price=4.9,
+                ask_price=5.1,
+                bid_size=12,
+                ask_size=10,
+                timestamp=datetime(2026, 9, 18, 14, 30, tzinfo=UTC),
             )
         }
 
@@ -103,3 +116,19 @@ async def test_chain_diagnostics_distinguish_missing_snapshot_from_empty_definit
     assert diagnostics.quoted_contracts == 0
     assert diagnostics.missing_snapshots == 1
     assert diagnostics.missing_quotes == 0
+
+
+@pytest.mark.asyncio
+async def test_latest_quote_fetches_the_exact_option_symbol() -> None:
+    adapter = AlpacaOptionChainAdapter(
+        "paper-key",
+        "paper-secret",
+        trading_client=FakeTradingClient(),
+        data_client=FakeDataClient(),
+    )
+
+    quote = await adapter.get_latest_quote("XYZ260925C00100000")
+
+    assert quote.bid == Decimal("4.9")
+    assert quote.ask == Decimal("5.1")
+    assert quote.greeks is None

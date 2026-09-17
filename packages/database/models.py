@@ -181,6 +181,10 @@ class ConditionalApprovalRecord(Base):
         UniqueConstraint(
             "workspace_id", "opportunity_id", name="uq_conditional_approval_opportunity"
         ),
+        UniqueConstraint(
+            "workspace_id", "position_asset_id", "session_date",
+            name="uq_conditional_exit_position_session",
+        ),
     )
 
     approval_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
@@ -189,15 +193,17 @@ class ConditionalApprovalRecord(Base):
         ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
         index=True,
     )
-    opportunity_id: Mapped[UUID] = mapped_column(
+    opportunity_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("connected_opportunities.opportunity_id", ondelete="CASCADE"),
         index=True,
+        nullable=True,
     )
     approved_by_user_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True), ForeignKey("app_users.user_id", ondelete="RESTRICT")
     )
     state: Mapped[str] = mapped_column(String(32), index=True)
+    approval_kind: Mapped[str] = mapped_column(String(16), default="OPEN", index=True)
     session_date: Mapped[date] = mapped_column(Date, index=True)
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -207,6 +213,11 @@ class ConditionalApprovalRecord(Base):
     max_loss: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     max_quantity: Mapped[int] = mapped_column(Integer)
     max_quote_age_seconds: Mapped[int] = mapped_column(Integer)
+    min_limit_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
+    position_asset_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    position_symbol: Mapped[str | None] = mapped_column(String(32), index=True)
+    position_side: Mapped[str | None] = mapped_column(String(16))
+    exit_order_side: Mapped[str | None] = mapped_column(String(8))
     broker_order_id: Mapped[str | None] = mapped_column(String(128), index=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)

@@ -14,6 +14,7 @@ from packages.domain.broker import (
     OrderSubmission,
     SubmissionLeg,
 )
+from packages.execution.conditional_approval import ExitOrderSide
 
 
 def raw_account() -> SimpleNamespace:
@@ -168,3 +169,30 @@ async def test_alpaca_close_position_delegates_and_maps_order() -> None:
     order = await adapter.close_position("NVDA260918C00120000")
     assert order.broker_order_id == "order-1"
     assert order.status == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_alpaca_limit_exit_submits_single_leg_with_explicit_side() -> None:
+    client = FakeTradingClient()
+    adapter = AlpacaPaperBrokerAdapter(
+        "paper-key",
+        "paper-secret",
+        trading_client=client,
+        trading_stream=FakeTradingStream(),
+    )
+
+    order = await adapter.submit_close_limit(
+        symbol="NVDA260918C00120000",
+        quantity=2,
+        limit_price="3.50",
+        order_side=ExitOrderSide.SELL,
+        client_order_id="ad-exit-1",
+    )
+
+    assert order.broker_order_id == "order-1"
+    submitted_request = cast(Any, client.submitted_request)
+    assert submitted_request.symbol == "NVDA260918C00120000"
+    assert submitted_request.qty == 2
+    assert submitted_request.limit_price == 3.5
+    assert submitted_request.side.value == "sell"
+    assert submitted_request.client_order_id == "ad-exit-1"

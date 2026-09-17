@@ -20,7 +20,7 @@ import { DemoGuidedTour } from "@/components/demo-guided-tour";
 
 type Mode = "demo" | "desk";
 
-const icons = { command: LayoutDashboard, scanner: Radar, positions: BriefcaseBusiness, lab: FlaskConical, guardian: ShieldCheck, settings: Settings, invites: TicketCheck };
+const icons = { command: LayoutDashboard, scanner: Radar, positions: BriefcaseBusiness, approvals: TicketCheck, lab: FlaskConical, guardian: ShieldCheck, settings: Settings, invites: TicketCheck };
 
 const demoNavigation = [
   ["Command Center", "/demo", "command"],
@@ -33,6 +33,7 @@ const demoNavigation = [
 const deskNavigation = [
   ["Workspace Control", "/desk", "command"],
   ["Market Scanner", "/desk/scanner", "scanner"],
+  ["Pre-approved", "/desk/approvals", "approvals"],
   ["Positions & Orders", "/desk/positions", "positions"],
   ["Audit & Guardian", "/desk/audit", "guardian"],
   ["Credential Settings", "/desk/settings", "settings"],

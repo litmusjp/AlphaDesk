@@ -42,13 +42,14 @@ class ConditionalApprovalStore:
             return len(records)
 
     async def claim_next(
-        self, *, workspace_id: UUID, session_date: date, now: datetime
+        self, *, workspace_id: UUID, session_date: date, now: datetime, approval_kind: str = "OPEN"
     ) -> ConditionalApprovalRecord | None:
         async with self._database.sessions.begin() as session:
             record = await session.scalar(
                 select(ConditionalApprovalRecord)
                 .where(
                     ConditionalApprovalRecord.workspace_id == workspace_id,
+                    ConditionalApprovalRecord.approval_kind == approval_kind,
                     ConditionalApprovalRecord.session_date == session_date,
                     ConditionalApprovalRecord.state == ApprovalState.APPROVED_FOR_SESSION,
                     ConditionalApprovalRecord.expires_at > now,
