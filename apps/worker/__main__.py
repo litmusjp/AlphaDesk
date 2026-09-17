@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
@@ -243,9 +244,11 @@ async def _scanner_supervisor(
                 )
                 completed_count = 0
                 failed_count = 0
+                dispositions: Counter[str] = Counter()
                 for symbol in symbols:
                     try:
-                        await service.analyze(symbol, scan_run_id=run.scan_run_id)
+                        result = await service.analyze(symbol, scan_run_id=run.scan_run_id)
+                        dispositions[result.disposition] += 1
                         completed_count += 1
                     except Exception as error:
                         failed_count += 1
@@ -263,6 +266,19 @@ async def _scanner_supervisor(
                     run.scan_run_id,
                     completed_count=completed_count,
                     failed_count=failed_count,
+                )
+                logger.info(
+                    "workspace_scan_completed",
+                    extra={
+                        "event": "workspace_scan_completed",
+                        "workspace_id": str(workspace.workspace_id),
+                        "scan_run_id": str(run.scan_run_id),
+                        "trigger": run.trigger,
+                        "attempted": len(symbols),
+                        "completed": completed_count,
+                        "failed": failed_count,
+                        "dispositions": dict(dispositions),
+                    },
                 )
                 last_scans[workspace.workspace_id] = now
         await _wait_or_stop(stop, 30)

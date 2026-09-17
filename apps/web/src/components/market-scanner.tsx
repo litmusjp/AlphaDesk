@@ -142,6 +142,14 @@ export function MarketScanner() {
   const latestSelected = Boolean(selectedRun && runs[0]?.scan_run_id === selectedRun.scan_run_id);
   const nextEvent = clock ? (clock.is_open ? clock.next_close : clock.next_open) : null;
   const countdown = formatCountdown(nextEvent, now);
+  const dispositionCounts = results.reduce<Record<string, number>>((counts, result) => {
+    counts[result.disposition] = (counts[result.disposition] ?? 0) + 1;
+    return counts;
+  }, {});
+  const scoreFor = (result: Analysis) => {
+    const value = Number(result.signal.score);
+    return Number.isFinite(value) ? `${value.toFixed(2)} / 100` : "—";
+  };
 
   return <>
     <section className={`market-clock-strip ${clock?.is_open ? "open" : "closed"}`} aria-live="polite">
@@ -173,12 +181,12 @@ export function MarketScanner() {
       </div>
     ) : null}
 
-    <div className="scanner-toolbar"><div><small>{latestSelected ? "LATEST SCAN RESULTS" : "HISTORICAL SCAN RESULTS"}</small><strong>{selectedRun ? `${selectedRun.completed} / ${selectedRun.attempted} watchlist symbols` : `${symbols.length} / 25 watchlist symbols`}</strong>{selectedRun ? <span>{easternDateTime.format(new Date(selectedRun.started_at))} · {selectedRun.trigger.toLowerCase()}</span> : null}</div><label className="toggle"><input type="checkbox" checked={workspace?.scanner_enabled ?? false} onChange={toggle}/><span/>5-minute market-hours scan</label><button disabled={busy || symbols.length === 0} onClick={scan}><Play/>{busy ? "Scanning…" : "Scan now"}</button></div>
+    <div className="scanner-toolbar"><div><small>{latestSelected ? "LATEST SCAN RESULTS" : "HISTORICAL SCAN RESULTS"}</small><strong>{selectedRun ? `${selectedRun.completed} / ${selectedRun.attempted} watchlist symbols` : `${symbols.length} / 25 watchlist symbols`}</strong>{selectedRun ? <span>{easternDateTime.format(new Date(selectedRun.started_at))} · {selectedRun.trigger.toLowerCase()}</span> : null}<span>{Object.entries(dispositionCounts).map(([name, count]) => `${count} ${name.replaceAll("_", " ")}`).join(" · ") || "No dispositions yet"}</span></div><label className="toggle"><input type="checkbox" checked={workspace?.scanner_enabled ?? false} onChange={toggle}/><span/>5-minute market-hours scan</label><button disabled={busy || symbols.length === 0} onClick={scan}><Play/>{busy ? "Scanning…" : "Scan now"}</button></div>
     {message ? <p className="form-message">{message}</p> : null}
     <form className="watchlist-form" onSubmit={saveWatchlist}><label>Replace watchlist (comma or space separated)<input value={entry} onChange={(event) => setEntry(event.target.value)} placeholder={symbols.join(", ") || "SPY, QQQ, AAPL, MSFT"}/></label><button className="secondary-button">Save watchlist</button></form>
 
     <div className="scanner-results-layout">
-      <section className="data-table"><header><span>OPPORTUNITY</span><span>DISPOSITION</span><span>SOURCE</span><span>OBSERVED</span><span>ACTION</span></header>{results.length === 0 ? <div className="table-empty"><Radar/><strong>No scan results yet</strong><p>Run a scan to evaluate your watchlist using verified real Alpaca data.</p></div> : results.map((result) => <div className="data-row" key={result.opportunity_id}><strong>{result.symbol}</strong><div><span className={`status-pill ${result.disposition === "TRADE" ? "good" : ""}`}>{result.disposition.replaceAll("_", " ")}</span>{result.disposition === "UNAVAILABLE" ? <small style={{ color: "#915714", fontSize: "8px", display: "block", marginTop: "3px" }}>Stale / closed market</small> : null}</div><span>{result.source}</span><time>{easternDateTime.format(new Date(result.observed_at))}</time><Link href={`/desk/opportunities/${result.opportunity_id}`}>Review →</Link></div>)}</section>
+      <section className="data-table"><header><span>OPPORTUNITY</span><span>DISPOSITION / SCORE</span><span>SOURCE</span><span>OBSERVED</span><span>ACTION</span></header>{results.length === 0 ? <div className="table-empty"><Radar/><strong>No scan results yet</strong><p>Run a scan to evaluate your watchlist using verified real Alpaca data.</p></div> : results.map((result) => <div className="data-row" key={result.opportunity_id}><strong>{result.symbol}</strong><div><span className={`status-pill ${result.disposition === "TRADE" ? "good" : ""}`}>{result.disposition.replaceAll("_", " ")}</span><small style={{ display: "block", marginTop: "3px" }}>Score {scoreFor(result)}</small>{result.reason_codes.length ? <small style={{ display: "block", marginTop: "3px" }}>{result.reason_codes.join(", ")}</small> : null}</div><span>{result.source}</span><time>{easternDateTime.format(new Date(result.observed_at))}</time><Link href={`/desk/opportunities/${result.opportunity_id}`}>Review →</Link></div>)}</section>
       <aside className="scan-history" aria-label="Scan history"><h2><History/>Scan history</h2>{runs.length === 0 ? <p>No completed scans.</p> : runs.slice(0, 5).map((run, index) => <button className={run.scan_run_id === selectedRunId ? "selected" : ""} disabled={historyBusy} key={run.scan_run_id} onClick={() => void selectRun(run)}><span>{index === 0 ? <b>Latest scan</b> : easternDateTime.format(new Date(run.started_at))}</span><strong>{run.completed} / {run.attempted}</strong><small>{run.failed ? `${run.failed} failed` : "all processed"}</small></button>)}</aside>
     </div>
     <button className="refresh-link" onClick={() => void refreshStoredResults()}><RefreshCw/>Refresh scan history</button>

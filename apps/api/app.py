@@ -108,7 +108,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_origins=[
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "https://web-production-1aedb.up.railway.app",
+        ],
         allow_methods=["DELETE", "GET", "POST", "PUT"],
         allow_headers=["Accept", "Authorization", "Content-Type"],
         allow_credentials=True,
