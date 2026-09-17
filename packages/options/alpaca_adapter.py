@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Any, cast
@@ -23,6 +24,15 @@ class OptionChainQuery(BaseModel):
     expiration_date_lte: date
     strike_price_gte: Decimal | None = None
     strike_price_lte: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class OptionChainFetchDiagnostics:
+    contract_definitions: int
+    snapshots: int
+    quoted_contracts: int
+    missing_snapshots: int
+    missing_quotes: int
 
 
 class AlpacaOptionChainAdapter:
@@ -127,16 +137,40 @@ class AlpacaOptionChainAdapter:
         return self._data.get_option_chain(request)
 
     async def get_chain(self, query: OptionChainQuery) -> tuple[OptionContract, ...]:
+        normalized, _ = await self.get_chain_with_diagnostics(query)
+        return normalized
+
+    async def get_chain_with_diagnostics(
+        self, query: OptionChainQuery
+    ) -> tuple[tuple[OptionContract, ...], OptionChainFetchDiagnostics]:
         contracts, snapshots = await asyncio.gather(
             asyncio.to_thread(self._get_contracts, query),
             asyncio.to_thread(self._get_snapshots, query),
         )
         normalized: list[OptionContract] = []
+        missing_snapshots = 0
+        missing_quotes = 0
         for contract in contracts:
             snapshot = snapshots.get(str(contract.symbol))
-            if snapshot is None or snapshot.latest_quote is None:
+            if snapshot is None:
+                missing_snapshots += 1
+                continue
+            if snapshot.latest_quote is None:
+                missing_quotes += 1
                 continue
             normalized.append(self._map_contract(contract, snapshot))
-        return tuple(
-            sorted(normalized, key=lambda item: (item.expiration, item.strike, item.option_type))
+        return (
+            tuple(
+                sorted(
+                    normalized,
+                    key=lambda item: (item.expiration, item.strike, item.option_type),
+                )
+            ),
+            OptionChainFetchDiagnostics(
+                contract_definitions=len(contracts),
+                snapshots=len(snapshots),
+                quoted_contracts=len(normalized),
+                missing_snapshots=missing_snapshots,
+                missing_quotes=missing_quotes,
+            ),
         )

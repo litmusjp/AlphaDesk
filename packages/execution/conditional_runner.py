@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 
 from packages.connected.opportunities import ConnectedAnalysis, ConnectedOpportunityService
+from packages.connected.option_scan_policy import ScanMode
 from packages.database.models import ConnectedOpportunityRecord
 from packages.database.session import Database
 from packages.domain.workflow import OrderIntent, RankedCandidate
@@ -77,7 +78,7 @@ async def process_workspace_approvals(
                 workspace_id,
                 str(secret["api_key_id"]),
                 str(secret["secret_key"]),
-            ).analyze(original.symbol)
+            ).analyze(original.symbol, mode=ScanMode.EXECUTION)
             if (
                 fresh.disposition != "TRADE"
                 or fresh.order_intent is None
