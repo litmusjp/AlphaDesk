@@ -8,7 +8,13 @@ from typing import Any
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import (
+    OrderClass,
+    OrderSide,
+    PositionIntent,
+    QueryOrderStatus,
+    TimeInForce,
+)
 from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, OptionLegRequest
 from alpaca.trading.stream import TradingStream
 
@@ -21,6 +27,7 @@ from packages.domain.broker import (
     OrderSubmission,
     ReconciliationSnapshot,
 )
+from packages.execution.conditional_approval import ExitOrderSide
 
 
 def _text(value: object | None, default: str = "") -> str:
@@ -185,6 +192,36 @@ class AlpacaPaperBrokerAdapter:
 
     async def close_position(self, symbol_or_asset_id: str) -> BrokerOrder:
         raw = await asyncio.to_thread(self._client.close_position, symbol_or_asset_id)
+        return self._map_order(raw)
+
+    async def submit_close_limit(
+        self,
+        *,
+        symbol: str,
+        quantity: int,
+        limit_price: str,
+        order_side: ExitOrderSide,
+        client_order_id: str,
+    ) -> BrokerOrder:
+        if quantity <= 0:
+            raise ValueError("Close quantity must be positive.")
+        side = OrderSide.SELL if order_side is ExitOrderSide.SELL else OrderSide.BUY
+        position_intent = (
+            PositionIntent.SELL_TO_CLOSE
+            if order_side is ExitOrderSide.SELL
+            else PositionIntent.BUY_TO_CLOSE
+        )
+        request = LimitOrderRequest(
+            symbol=symbol,
+            qty=quantity,
+            limit_price=float(limit_price),
+            side=side,
+            type="limit",
+            time_in_force=TimeInForce.DAY,
+            position_intent=position_intent,
+            client_order_id=client_order_id,
+        )
+        raw = await asyncio.to_thread(self._client.submit_order, request)
         return self._map_order(raw)
 
     async def get_order(

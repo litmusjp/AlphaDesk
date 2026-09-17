@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, cast
 
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionChainRequest
+from alpaca.data.requests import OptionChainRequest, OptionLatestQuoteRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetStatus
 from alpaca.trading.requests import GetOptionContractsRequest
@@ -135,6 +135,24 @@ class AlpacaOptionChainAdapter:
             ),
         )
         return self._data.get_option_chain(request)
+
+    async def get_latest_quote(self, symbol: str) -> OptionQuote:
+        response = await asyncio.to_thread(
+            self._data.get_option_latest_quote, OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+        )
+        quote = cast(Any, response).get(symbol)
+        if quote is None:
+            raise ValueError(f"Latest quote unavailable for {symbol}")
+        return OptionQuote(
+            bid=Decimal(str(quote.bid_price)),
+            ask=Decimal(str(quote.ask_price)),
+            bid_size=Decimal(str(quote.bid_size)),
+            ask_size=Decimal(str(quote.ask_size)),
+            quoted_at=quote.timestamp,
+            open_interest=None,
+            implied_volatility=None,
+            greeks=None,
+        )
 
     async def get_chain(self, query: OptionChainQuery) -> tuple[OptionContract, ...]:
         normalized, _ = await self.get_chain_with_diagnostics(query)

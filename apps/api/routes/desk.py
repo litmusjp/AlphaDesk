@@ -50,6 +50,7 @@ from packages.domain.system import BrokerState
 from packages.domain.workflow import OrderIntent, RankedCandidate
 from packages.execution.conditional_approval import (
     ApprovalState,
+    ExitOrderSide,
     order_structure_fingerprint,
 )
 from packages.execution.connected_paper import execute_connected_paper_order
@@ -182,11 +183,19 @@ class ConditionalApprovalInput(BaseModel):
     max_quote_age_seconds: int = Field(default=30, ge=1, le=300)
 
 
+class ConditionalExitApprovalInput(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    limit_price_bound: Decimal | None = Field(default=None, gt=0)
+    max_quote_age_seconds: int = Field(default=30, ge=1, le=300)
+
+
 class ConditionalApprovalView(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     approval_id: UUID
-    opportunity_id: UUID
+    opportunity_id: UUID | None
+    approval_kind: Literal["OPEN", "CLOSE"]
     symbol: str
     state: str
     session_date: date
@@ -198,6 +207,10 @@ class ConditionalApprovalView(BaseModel):
     max_loss: Decimal
     max_quantity: int
     max_quote_age_seconds: int
+    min_limit_price: Decimal | None
+    position_asset_id: str | None
+    position_side: str | None
+    exit_order_side: str | None
     broker_order_id: str | None
     failure_reason: str | None
 
@@ -238,12 +251,13 @@ def _credential_view(
 
 
 def _conditional_approval_view(
-    record: ConditionalApprovalRecord, symbol: str
+    record: ConditionalApprovalRecord, symbol: str | None
 ) -> ConditionalApprovalView:
     return ConditionalApprovalView(
         approval_id=record.approval_id,
         opportunity_id=record.opportunity_id,
-        symbol=symbol,
+        approval_kind=record.approval_kind,
+        symbol=symbol or record.position_symbol or "UNKNOWN",
         state=record.state,
         session_date=record.session_date,
         approved_at=record.approved_at,
@@ -254,6 +268,10 @@ def _conditional_approval_view(
         max_loss=record.max_loss,
         max_quantity=record.max_quantity,
         max_quote_age_seconds=record.max_quote_age_seconds,
+        min_limit_price=record.min_limit_price,
+        position_asset_id=record.position_asset_id,
+        position_side=record.position_side,
+        exit_order_side=record.exit_order_side,
         broker_order_id=record.broker_order_id,
         failure_reason=record.failure_reason,
     )
@@ -836,7 +854,7 @@ async def list_conditional_approvals(
         rows = list(
             await session.execute(
                 select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
-                .join(
+                .outerjoin(
                     ConnectedOpportunityRecord,
                     ConnectedOpportunityRecord.opportunity_id
                     == ConditionalApprovalRecord.opportunity_id,
@@ -913,6 +931,7 @@ async def approve_for_next_session(
             opportunity_id=opportunity_id,
             approved_by_user_id=context.principal.user_id,
             state=ApprovalState.APPROVED_FOR_SESSION,
+            approval_kind="OPEN",
             session_date=session_date,
             approved_at=now,
             expires_at=expires_at,
@@ -947,6 +966,123 @@ async def approve_for_next_session(
         return _conditional_approval_view(record, opportunity.symbol)
 
 
+@router.post(
+    "/broker/positions/{symbol_or_asset_id}/approve-close-session",
+    response_model=ConditionalApprovalView,
+)
+async def approve_position_close_for_next_session(
+    symbol_or_asset_id: str,
+    payload: ConditionalExitApprovalInput,
+    request: Request,
+    context: WorkspaceContext = Depends(require_workspace),
+) -> ConditionalApprovalView:
+    session_date, expires_at = await _next_session_window(request, context)
+    secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
+    if secrets is None:
+        raise HTTPException(status_code=409, detail="Alpaca credential unavailable")
+    adapter = AlpacaPaperBrokerAdapter(str(secrets["api_key_id"]), str(secrets["secret_key"]))
+    try:
+        snapshot = await adapter.reconcile()
+    except Exception as error:
+        raise HTTPException(
+            status_code=422, detail="Paper position could not be revalidated"
+        ) from error
+    finally:
+        await adapter.close()
+
+    position = next(
+        (
+            item
+            for item in snapshot.positions
+            if item.asset_id == symbol_or_asset_id or item.symbol == symbol_or_asset_id
+        ),
+        None,
+    )
+    if position is None:
+        raise HTTPException(status_code=404, detail="Exact broker position not found")
+    if position.asset_class != "us_option":
+        raise HTTPException(
+            status_code=422, detail="Conditional close approvals are limited to options"
+        )
+    quantity = position.quantity
+    if quantity <= 0 or quantity != quantity.to_integral_value():
+        raise HTTPException(
+            status_code=422, detail="Broker position quantity is not a whole contract count"
+        )
+    if position.side not in {"long", "short"}:
+        raise HTTPException(status_code=422, detail="Broker position side is not closeable")
+    if position.current_price is None or position.current_price <= 0:
+        raise HTTPException(
+            status_code=409, detail="A current option price is required to bound the close"
+        )
+    order_side = ExitOrderSide.SELL if position.side == "long" else ExitOrderSide.BUY
+    bound = payload.limit_price_bound or position.current_price
+    now = datetime.now(UTC)
+    async with request.app.state.database.sessions.begin() as session:
+        existing = await session.scalar(
+            select(ConditionalApprovalRecord).where(
+                ConditionalApprovalRecord.workspace_id == context.workspace_id,
+                ConditionalApprovalRecord.approval_kind == "CLOSE",
+                ConditionalApprovalRecord.position_asset_id == position.asset_id,
+                ConditionalApprovalRecord.state.in_((
+                    ApprovalState.APPROVED_FOR_SESSION,
+                    ApprovalState.REVALIDATING,
+                )),
+            )
+        )
+        if existing is not None:
+            raise HTTPException(
+                status_code=409, detail="This exact position already has an active close approval"
+            )
+        record = ConditionalApprovalRecord(
+            approval_id=uuid4(),
+            workspace_id=context.workspace_id,
+            opportunity_id=None,
+            approved_by_user_id=context.principal.user_id,
+            state=ApprovalState.APPROVED_FOR_SESSION,
+            approval_kind="CLOSE",
+            session_date=session_date,
+            approved_at=now,
+            expires_at=expires_at,
+            client_order_id=f"ad-exit-{uuid4().hex}",
+            structure_fingerprint=(
+                f"EXIT:{position.asset_id}:{position.symbol}:{position.side}:{quantity}"
+            ),
+            max_limit_price=bound if order_side is ExitOrderSide.BUY else Decimal("0"),
+            min_limit_price=bound if order_side is ExitOrderSide.SELL else None,
+            max_loss=Decimal("0"),
+            max_quantity=int(quantity),
+            max_quote_age_seconds=payload.max_quote_age_seconds,
+            position_asset_id=position.asset_id,
+            position_symbol=position.symbol,
+            position_side=position.side,
+            exit_order_side=order_side.value,
+            broker_order_id=None,
+            failure_reason=None,
+            claimed_at=None,
+            submitted_at=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(record)
+        session.add(
+            AuditRecord(
+                audit_id=uuid4(),
+                workspace_id=context.workspace_id,
+                actor_user_id=context.principal.user_id,
+                action="CONDITIONAL_EXIT_APPROVAL_CREATED",
+                detail={
+                    "approval_id": str(record.approval_id),
+                    "position_asset_id": position.asset_id,
+                    "position_symbol": position.symbol,
+                    "session_date": session_date.isoformat(),
+                },
+                occurred_at=now,
+            )
+        )
+        return _conditional_approval_view(record, position.symbol)
+
+
 @router.post("/approvals/{approval_id}/reject", response_model=ConditionalApprovalView)
 async def reject_conditional_approval(
     approval_id: UUID,
@@ -957,7 +1093,7 @@ async def reject_conditional_approval(
     async with request.app.state.database.sessions.begin() as session:
         row = await session.execute(
             select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
-            .join(
+            .outerjoin(
                 ConnectedOpportunityRecord,
                 ConnectedOpportunityRecord.opportunity_id
                 == ConditionalApprovalRecord.opportunity_id,

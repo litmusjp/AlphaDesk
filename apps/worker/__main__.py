@@ -28,6 +28,7 @@ from packages.database.models import (
 )
 from packages.database.session import Database
 from packages.event_bus.client import JetStreamEventBus
+from packages.execution.conditional_exit_runner import process_workspace_exit_approvals
 from packages.execution.conditional_runner import process_workspace_approvals
 from packages.observability.logging import configure_logging, get_logger
 from packages.security.credentials import CredentialCipher, CredentialConfigurationError
@@ -411,6 +412,12 @@ async def _scanner_supervisor(
                 if not await _alpaca_market_is_open(credential_store, workspace.workspace_id):
                     continue
                 await process_workspace_approvals(
+                    database=database,
+                    cipher=cipher,
+                    workspace_id=workspace.workspace_id,
+                    now=now,
+                )
+                await process_workspace_exit_approvals(
                     database=database,
                     cipher=cipher,
                     workspace_id=workspace.workspace_id,

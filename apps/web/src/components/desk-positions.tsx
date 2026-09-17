@@ -27,6 +27,7 @@ type Position = {
   quantity: string;
   market_value: string;
   unrealized_pl: string;
+  current_price?: string | null;
 };
 
 type Order = {
@@ -107,6 +108,29 @@ export function DeskPositions() {
       setActionMessage({
         type: "error",
         text: e instanceof Error ? e.message : `Failed to close position for ${symbol}`,
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleApproveClose(position: Position) {
+    setBusy(true);
+    setActionMessage(null);
+    try {
+      await deskFetch(`/desk/broker/positions/${encodeURIComponent(position.asset_id)}/approve-close-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      setActionMessage({
+        type: "success",
+        text: `Bounded close approval created for ${position.symbol}. Review it in Pre-approved; no order was submitted.`,
+      });
+    } catch (e) {
+      setActionMessage({
+        type: "error",
+        text: e instanceof Error ? e.message : `Failed to approve close for ${position.symbol}`,
       });
     } finally {
       setBusy(false);
@@ -270,22 +294,32 @@ export function DeskPositions() {
                       </button>
                     </div>
                   ) : (
-                    <button
-                      className="secondary-button"
-                      style={{
-                        color: "#a8372c",
-                        borderColor: "#f3c2be",
-                        fontSize: "11px",
-                        padding: "4px 10px",
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: "4px",
-                      }}
-                      onClick={() => setClosingSymbol(p.symbol)}
-                    >
-                      <LogOut size={12} />
-                      Close Position
-                    </button>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
+                      <button
+                        className="secondary-button"
+                        style={{
+                          color: "#a8372c",
+                          borderColor: "#f3c2be",
+                          fontSize: "11px",
+                          padding: "4px 10px",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "4px",
+                        }}
+                        onClick={() => setClosingSymbol(p.symbol)}
+                      >
+                        <LogOut size={12} />
+                        Close Position
+                      </button>
+                      <button
+                        className="secondary-button"
+                        style={{ fontSize: "10px", padding: "4px 7px" }}
+                        disabled={busy}
+                        onClick={() => handleApproveClose(p)}
+                      >
+                        {busy ? "Approving…" : "Pre-approve next session"}
+                      </button>
+                    </div>
                   )}
                 </div>
               </div>
