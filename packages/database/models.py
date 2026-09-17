@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -172,6 +173,46 @@ class ConnectedOpportunityRecord(Base):
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ConditionalApprovalRecord(Base):
+    __tablename__ = "conditional_approvals"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "opportunity_id", name="uq_conditional_approval_opportunity"
+        ),
+    )
+
+    approval_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    workspace_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("workspaces.workspace_id", ondelete="CASCADE"),
+        index=True,
+    )
+    opportunity_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("connected_opportunities.opportunity_id", ondelete="CASCADE"),
+        index=True,
+    )
+    approved_by_user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("app_users.user_id", ondelete="RESTRICT")
+    )
+    state: Mapped[str] = mapped_column(String(32), index=True)
+    session_date: Mapped[date] = mapped_column(Date, index=True)
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    client_order_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    structure_fingerprint: Mapped[str] = mapped_column(String(512))
+    max_limit_price: Mapped[Decimal] = mapped_column(Numeric(20, 8))
+    max_loss: Mapped[Decimal] = mapped_column(Numeric(20, 8))
+    max_quantity: Mapped[int] = mapped_column(Integer)
+    max_quote_age_seconds: Mapped[int] = mapped_column(Integer)
+    broker_order_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class AuditRecord(Base):
