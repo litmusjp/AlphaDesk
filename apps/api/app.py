@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.routes.admin import router as admin_router
 from apps.api.routes.auth import router as auth_router
-from apps.api.routes.demo import router as demo_router
 from apps.api.routes.desk import router as desk_router
 from apps.api.routes.health import router as health_router
 from apps.api.routes.identity import router as identity_router
@@ -17,7 +16,6 @@ from packages.auth.jwt import SupabaseJWTVerifier
 from packages.auth.supabase_admin import SupabaseAdminAuth
 from packages.configuration.settings import Settings, get_settings
 from packages.database.session import Database
-from packages.demo.sessions import DemoSessionService, ephemeral_demo_key
 from packages.event_bus.client import JetStreamEventBus
 from packages.observability.logging import configure_logging, get_logger
 from packages.security.credentials import CredentialCipher, CredentialConfigurationError
@@ -42,7 +40,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.auth_verifier = None
         app.state.supabase_admin = None
         app.state.credential_cipher = None
-        app.state.demo_sessions = None
 
         if resolved_settings.infrastructure_checks:
             database = Database(resolved_settings.database_url)
@@ -55,13 +52,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await event_bus.ensure_stream()
             app.state.event_bus = event_bus
             app.state.readiness["event_bus"] = "healthy"
-
-            signing_key = (
-                ephemeral_demo_key()
-                if resolved_settings.demo_session_signing_key is None
-                else resolved_settings.demo_session_signing_key.get_secret_value().encode()
-            )
-            app.state.demo_sessions = DemoSessionService(database.sessions, signing_key)
 
         if resolved_settings.supabase_url:
             app.state.auth_verifier = SupabaseJWTVerifier(
@@ -122,11 +112,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.auth_verifier = None
     application.state.supabase_admin = None
     application.state.credential_cipher = None
-    application.state.demo_sessions = None
+
     application.include_router(health_router)
     application.include_router(system_router, prefix="/api/v1")
     application.include_router(auth_router, prefix="/api/v1")
-    application.include_router(demo_router, prefix="/api/v1")
+
     application.include_router(identity_router, prefix="/api/v1")
     application.include_router(admin_router, prefix="/api/v1")
     application.include_router(desk_router, prefix="/api/v1")

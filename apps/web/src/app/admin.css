@@ -30,8 +30,8 @@
 .admin-workspace-state > svg { width: 48px; height: 48px; margin: 76px 0 15px; color: #aab2af; }
 .admin-workspace-state h2 { font-size: 19px; }
 .admin-workspace-state > p { max-width: 320px; }
-.admin-workspace-state.ready { border-top: 3px solid var(--demo); }
-.admin-workspace-state.ready > svg { color: var(--demo); }
+.admin-workspace-state.ready { border-top: 3px solid var(--desk); }
+.admin-workspace-state.ready > svg { color: var(--desk); }
 .admin-workspace-ready { display: grid; grid-template-columns: 42px 1fr auto; align-items: center; gap: 14px; margin-top: 24px; padding: 22px; border: 1px solid #b9d2f2; border-radius: 7px; background: var(--desk-soft); }
 .admin-workspace-ready > svg { color: var(--desk); }
 .admin-workspace-ready h3, .admin-workspace-ready p { margin: 3px 0; }

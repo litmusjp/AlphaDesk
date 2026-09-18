@@ -24,7 +24,7 @@ describe("WorkspaceShell admin navigation", () => {
       workspace_id: null,
       workspace_status: null,
     });
-    render(<WorkspaceShell mode="desk" title="Admin" description="Console"><div>Body</div></WorkspaceShell>);
+    render(<WorkspaceShell title="Admin" description="Console"><div>Body</div></WorkspaceShell>);
 
     expect(await screen.findByRole("link", { name: /Admin Console/ })).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /Access & Invitations/ })).toBeInTheDocument();

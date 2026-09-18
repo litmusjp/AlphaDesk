@@ -1,42 +1,30 @@
-# AlphaDesk dual-workspace demo runbook
+# Connected Paper walkthrough
 
-Start the local stack:
+AlphaDesk now has one supported runtime: the authenticated, invitation-controlled Connected Paper Workspace.
 
-```bash
-docker compose --env-file .env.local up -d --build
-docker compose --env-file .env.local ps
-curl -fsS http://localhost:8000/health/ready
-```
+## Access and provisioning
 
-Open <http://localhost:3000>. The landing page makes the workspace boundary explicit.
+1. Open the web interface and sign in through `/login` using an invited identity.
+2. An existing administrator can open `/admin`, create a Paper Workspace, and manage invitations.
+3. An invited operator registers through `/register?code=...` and receives a tenant-scoped workspace after authentication.
 
-## Public Demo Workspace — green
+## Connected Paper Workspace
 
-No login or credentials are required.
+1. In **Credential Settings**, test and save Alpaca paper credentials and the configured AI-provider key/model.
+2. Confirm only masked fingerprints and verification state are returned after saving.
+3. In **Market Scanner**, verify the Alpaca market clock, Eastern time, regular-session guidance, and additive watchlist behavior.
+4. Click **Scan now**. Each row must show real provider provenance; after-hours stale evidence may correctly produce `UNAVAILABLE` or `NO_TRADE`.
+5. Review an opportunity and run the read-only AI analysis. Provider failure must degrade only the AI panel.
+6. If a fresh approved bounded-risk candidate exists, review every leg and risk check, acknowledge, and explicitly submit one Alpaca paper order.
+7. Verify broker-confirmed state in **Positions & Orders** and tenant-specific controls in **Audit & Guardian**.
 
-1. Enter **Public Demo Workspace** and point out `DEMO · SYNTHETIC DATA` and `EXECUTION: DISABLED`.
-2. Click **Start Interactive Tour** on the Command Center banner. The persistent 7-step guided tour stays active across route transitions, remembers state in `sessionStorage`, and can be minimized to a floating pill.
-3. In **Opportunities** (`/demo/opportunities`), use the tabbed scenario switcher to explore `TRADE (Approved)`, `NO TRADE (Disciplined Pass)`, and `VETOED (Risk Rejection)`. Notice the live **Scenario Explainer Card** describing the catalyst confidence, capital preservation discipline, and portfolio concentration rules behind each disposition.
-4. Inspect the bounded spread math (NVDA Bull Call Debit Spread), Greeks, and stable `ad-…` client-order ID. Emphasize that this code path cannot construct a broker adapter.
-5. In **Positions & Orders** (`/demo/positions`), review the simulated CQRS read model featuring realistic \$104k equity, aggregated portfolio Greeks ($\Delta$, $\Theta$, $\text{Vega}$), an active NVDA 120/125C Bull Call Spread, an AAPL Long Call, and active working orders.
-6. In **Audit & Demo Guardian** (`/demo/audit`), review the educational cards explaining the Kill Switch and Reset Demo operations. Click **Activate demo kill switch** to simulate a `MANUAL_KILL_SWITCH` fail-closed state, then click **Reset demo session** to demonstrate recovery. Note that this state belongs exclusively to that signed browser session (`alphadesk_demo`).
-7. In **Strategy Lab** (`/demo/strategy-lab`), show the point-in-time firewall (`SimulationClock`), walk-forward validation, and SHA-256 data fingerprint contracts.
+Paper submission is a real action against the operator's Alpaca paper account. Do not submit merely to make a failing scan appear successful.
 
-## Connected Paper Workspace — blue
+## Troubleshooting
 
-Supabase and a valid invitation are required.
-
-1. Sign in and show that every route is labeled `CONNECTED PAPER · REAL DATA / SIMULATED FUNDS`.
-2. In **Credential Settings**, test and save Alpaca paper and OpenRouter credentials. Values are write-only, encrypted with tenant-bound AES-256-GCM, and disappear from the form after encryption.
-3. In **Market Scanner**, observe the real-time market clock with live countdown to session open/close (e.g., `Opens in 35m` or `Closes in 6h 15m`). If outside market hours, point out the closed-market educational banner explaining why options quotes are stale or unavailable.
-4. Click **Scan now**. Connected results must say `ALPACA_REAL`; unavailable data produces no synthetic substitute. Run it again and show that scan history keeps each run separate.
-5. Review an opportunity and run the read-only OpenRouter analysis. AI degradation must not change the deterministic disposition or execution controls.
-6. If the scanner produces a fresh approved opportunity, point out quote expiry, payoff, risk checks, and stable client-order ID.
-7. Check the acknowledgement and click **Submit Paper Order** only when you intentionally want an Alpaca paper transaction. The API reruns freshness, risk, Guardian, broker reconciliation, account status, and idempotency checks.
-8. In **Positions & Orders**, show broker-confirmed projections. In **Audit & Guardian**, halt only this tenant and demonstrate reconciliation-gated recovery.
-
-`NO_TRADE` and `UNAVAILABLE` are valid connected outcomes. Do not force a paper order for the demo; use the public deterministic `TRADE` replay when the market does not provide an eligible live candidate.
-
-> AlphaDesk is for research and education. Alpaca paper funds are simulated. Live-money trading is absent.
-
-For the complete setup and validation procedure, see [`LOCAL_DEVELOPMENT.md`](./LOCAL_DEVELOPMENT.md).
+- **Registration unavailable:** check `/api/v1/auth/registration-status`, confirm public Supabase signup is disabled, and recreate the API after correcting server settings.
+- **Admin has no workspace:** this is expected for a Dashboard-created bootstrap identity. Open `/admin` and use **Create my Paper Workspace**.
+- **Scanner returns `UNAVAILABLE`:** inspect the visible market clock, quote age, data entitlements, and API/worker logs. Connected mode never substitutes fixtures.
+- **No scan history:** run **Scan now** once to create the first explicit scan-run record.
+- **AI says it needs more data:** verify the configured model and encrypted provider key. Structured-output failures are safely rejected and do not change deterministic risk or execution state.
+- **Worker does not connect:** verify the Alpaca credential status is `VERIFIED`, the workspace is not suspended, and the same credential master-key version used to encrypt records is available to the worker.

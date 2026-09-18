@@ -1,2 +1,5 @@
-import { redirect } from "next/navigation";
-export default function LegacyLab(){redirect("/demo/strategy-lab")}
+import { notFound } from "next/navigation";
+
+export default function RemovedDemoRoute(): never {
+  notFound();
+}

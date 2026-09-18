@@ -1,2 +1,5 @@
-import { redirect } from "next/navigation";
-export default function LegacyAudit(){redirect("/demo/audit")}
+import { notFound } from "next/navigation";
+
+export default function RemovedDemoRoute(): never {
+  notFound();
+}

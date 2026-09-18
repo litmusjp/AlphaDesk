@@ -32,7 +32,6 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
 - First output: `ALPHADESK_CREDENTIAL_MASTER_KEYS`
-- Second output: `ALPHADESK_DEMO_SESSION_SIGNING_KEY`
 
 For Connected Paper, also configure:
 
@@ -42,7 +41,7 @@ For Connected Paper, also configure:
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 - `ALPHADESK_ADMIN_EMAILS`
 
-Keep `ALPHADESK_MODE=PAPER_ONLY` and `LLM_PROVIDER=fixture`. The latter controls only the public synthetic demo; each connected operator supplies an OpenRouter key and model in the UI.
+Keep `ALPHADESK_MODE=PAPER_ONLY` and `LLM_PROVIDER=fixture`. Connected operators supply an AI-provider key and model in the UI.
 
 Never add Alpaca or OpenRouter operator credentials to `.env.local`. They belong in tenant-scoped **Credential Settings** and are stored encrypted in AlphaDesk PostgreSQL.
 
@@ -167,16 +166,6 @@ cd ../..
 `make check` runs the quality suite, but when `.env.local` contains Docker-internal hostnames, use the explicit Python test command above for database-backed integration tests.
 
 ## 7. Manual acceptance walkthrough
-
-### Public Demo Workspace
-
-1. Open the green Demo Workspace without signing in (<http://localhost:3000/demo>).
-2. Click **Start Interactive Tour** on the command center banner. Walk through the persistent 7-step guide across `/demo`, `/demo/opportunities`, `/demo/positions`, `/demo/audit`, and `/demo/strategy-lab`.
-3. In Opportunities, switch between `TRADE (Approved)`, `NO TRADE (Disciplined Pass)`, and `VETOED (Risk Rejection)` using the tab switcher. Review the dynamic scenario guidance cards explaining why each outcome occurred.
-4. Verify bounded-risk math, Greeks, and the stable `ad-...` client-order ID.
-5. In Positions & Orders, inspect the simulated CQRS read model showing an active NVDA Bull Call Spread, AAPL Long Call, aggregated Greeks, and working order queue.
-6. In Audit & Guardian, review the educational guidance cards. Activate and recover the Demo Guardian; open a second private browser session and confirm state does not leak.
-7. Verify that demo screens are labeled `DEMO · SYNTHETIC DATA`, indicate `EXECUTION: DISABLED`, and never expose broker submission adapters.
 
 ### Administrator and invitation registration
 

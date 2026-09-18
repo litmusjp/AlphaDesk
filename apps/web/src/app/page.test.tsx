@@ -3,12 +3,13 @@ import { describe, expect, it } from "vitest";
 
 import WorkspaceLanding from "./page";
 
-describe("workspace landing", () => {
-  it("clearly separates synthetic demo and connected paper modes", () => {
+describe("connected paper landing", () => {
+  it("offers only invite-based connected paper access", () => {
     render(<WorkspaceLanding />);
-    expect(screen.getByText("PAPER ONLY")).toBeInTheDocument();
-    expect(screen.getByText("Public Demo Workspace")).toBeInTheDocument();
-    expect(screen.getByText("Connected Paper Workspace")).toBeInTheDocument();
-    expect(screen.getByText("No live-money trading.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Connected Paper Workspace" })).toBeInTheDocument();
+    expect(screen.getByText("Invite-only access")).toBeInTheDocument();
+    expect(screen.queryByText(/Public Demo Workspace/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Choose your workspace/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /Sign in with invitation/i })).toHaveAttribute("href", "/login");
   });
 });

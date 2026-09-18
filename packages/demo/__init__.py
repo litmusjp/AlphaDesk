@@ -1,3 +1,1 @@
-from packages.demo.sessions import DemoSessionService
-
-__all__ = ["DemoSessionService"]
+"""Demo services are not part of the connected-paper application."""

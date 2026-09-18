@@ -69,9 +69,7 @@ class Settings(BaseSettings):
     credential_master_keys: SecretStr | None = Field(
         default=None, validation_alias="ALPHADESK_CREDENTIAL_MASTER_KEYS"
     )
-    demo_session_signing_key: SecretStr | None = Field(
-        default=None, validation_alias="ALPHADESK_DEMO_SESSION_SIGNING_KEY"
-    )
+
     workspace_connection_limit: int = Field(
         default=20, ge=1, le=100, validation_alias="ALPHADESK_WORKSPACE_CONNECTION_LIMIT"
     )
@@ -105,7 +103,6 @@ class Settings(BaseSettings):
         "supabase_url",
         "supabase_secret_key",
         "credential_master_keys",
-        "demo_session_signing_key",
         mode="before",
     )
     @classmethod

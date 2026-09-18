@@ -1,2 +1,5 @@
-import { redirect } from "next/navigation";
-export default function LegacyPositions(){redirect("/demo/positions")}
+import { notFound } from "next/navigation";
+
+export default function RemovedDemoRoute(): never {
+  notFound();
+}

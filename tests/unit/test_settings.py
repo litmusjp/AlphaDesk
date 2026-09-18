@@ -21,10 +21,8 @@ def test_secret_values_are_masked() -> None:
     settings = Settings(
         supabase_secret_key="sb_secret_test-only-value",
         credential_master_keys="v1:cGFwZXIta2V5LXRoYXQtaXMtZXhhY3RseS0zMmI",
-        demo_session_signing_key="paper-secret-that-is-at-least-32-characters",
         _env_file=None,
     )
-    assert "paper-secret" not in repr(settings)
     assert "cGFwZXI" not in repr(settings)
     assert "sb_secret_test-only-value" not in repr(settings)
 

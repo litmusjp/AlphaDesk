@@ -265,9 +265,6 @@ export function MarketScanner() {
           <p>
             The scan now keeps plausible option structures for review even when quotes are stale. Those candidates are labeled execution-pending; fresh quotes and every risk gate are required again at the next U.S. session before any paper order.
           </p>
-          <Link href="/demo">
-            Try the Public Demo Workspace with interactive scenario replays →
-          </Link>
         </div>
       </div>
     ) : null}

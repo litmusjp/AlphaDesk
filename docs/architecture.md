@@ -1,13 +1,8 @@
-# AlphaDesk dual-workspace architecture
+# AlphaDesk Connected Paper architecture
 
 ```mermaid
 flowchart TB
-  Visitor[Anonymous visitor] --> DemoSession[Signed expiring demo session]
-  DemoSession --> Fixtures[Versioned synthetic replay fixtures]
-  DemoSession --> DemoGuardian[Session-scoped Demo Guardian]
-  Fixtures --> DemoUI[Green Demo Workspace]
-
-  Operator[Invited operator] --> Supabase[Hosted Supabase Free Auth]
+  Operator[Invited operator] --> Supabase[Hosted Supabase Auth]
   Supabase --> JWT[Verified JWT identity]
   JWT --> Tenant[Server-derived connected workspace]
   Tenant --> Vault[AES-256-GCM BYOK vault]
@@ -23,20 +18,20 @@ flowchart TB
   Confirm --> Safety[Freshness + Risk + Guardian + Idempotency]
   Safety --> Execution[Execution Engine]
   Execution --> Alpaca
-  Projections --> DeskUI[Blue Connected Paper Workspace]
-
-  Tenant --> Postgres[(Lightsail PostgreSQL)]
-  DemoSession --> Postgres
+  Projections --> DeskUI[Connected Paper Workspace]
+  Tenant --> Postgres[(PostgreSQL)]
   Tenant --> NATS[NATS subjects namespaced by workspace]
 ```
 
 ## Security boundaries
 
-- Demo routes cannot construct a broker adapter and never fall back to connected data.
+- Runtime exposes only authenticated Connected Paper operator workflows; the public demo router and session startup are not mounted.
 - Connected routes require a valid Supabase JWT. The API derives the workspace from the authenticated subject and never accepts a tenant ID from the browser.
-- Operator Alpaca and OpenRouter secrets are write-only, encrypted with unique nonces and tenant-bound associated data, and stored only in AlphaDesk PostgreSQL.
+- Operator Alpaca and AI-provider secrets are write-only, encrypted with unique nonces and tenant-bound associated data, and stored only in AlphaDesk PostgreSQL.
 - Supabase's server secret is available only to the API. The worker receives an explicit empty override and the browser receives only public Supabase configuration.
 - The worker decrypts a credential only in memory and supervises each workspace independently.
-- Manual and scheduled scans create workspace-scoped scan-run records. Opportunity rows retain real-source timestamps and provenance; older ungrouped rows are not assigned fabricated history.
+- Manual and scheduled scans create workspace-scoped scan-run records. Opportunity rows retain real-source timestamps and provenance.
 - Only the Execution Engine submits orders. Every paper order requires a fresh explicit confirmation and is reconciled by stable client-order ID.
 - PostgreSQL and NATS have no published ports in the Lightsail Compose file. Caddy is the only public ingress.
+
+The historical demo-session migration and model are retained so existing databases are not altered destructively; they are not reachable through the application runtime.

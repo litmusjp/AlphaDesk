@@ -14,7 +14,7 @@
     </linearGradient>
   </defs>
 
-  <!-- Background tile with dual-workspace border -->
+  <!-- Connected Paper application icon -->
   <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="2.5" />
 
   <!-- Candlesticks (AlphaDesk Quant Signals) -->
