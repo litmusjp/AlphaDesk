@@ -1,7 +1,7 @@
 "use client";
 
 import { AlertTriangle, CheckCircle2, Clock3, ShieldCheck } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { deskFetch } from "@/lib/api";
 
@@ -18,45 +18,33 @@ type ConditionalApproval = { approval_id: string; opportunity_id: string; state:
 export function OrderReview({ id }: { id: string }) {
   const [opportunity, setOpportunity] = useState<Analysis | null>(null);
   const [approval, setApproval] = useState<ConditionalApproval | null>(null);
-  const [ack, setAck] = useState(false);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     const [nextOpportunity, approvals] = await Promise.all([
       deskFetch<Analysis>(`/desk/opportunities/${id}`),
       deskFetch<ConditionalApproval[]>("/desk/approvals"),
     ]);
     setOpportunity(nextOpportunity);
     setApproval(approvals.find((item) => item.opportunity_id === id) ?? null);
-  }
-
-  useEffect(() => {
-    void refresh().catch((error: Error) => setMessage(error.message));
   }, [id]);
 
-  const expired = useMemo(() => !opportunity || new Date(opportunity.expires_at) <= new Date(), [opportunity]);
+  useEffect(() => {
+    const kickoff = setTimeout(() => {
+      void refresh().catch((error: Error) => setMessage(error.message));
+    }, 0);
+    return () => clearTimeout(kickoff);
+  }, [refresh]);
+
   if (!opportunity) return <section className="loading-panel">{message || "Loading immutable order review…"}</section>;
 
   const structure = opportunity.candidate?.structure;
   const intent = opportunity.order_intent;
   const checks = opportunity.risk_decision?.checks ?? [];
-  const allowed = opportunity.source === "ALPACA_REAL" && opportunity.disposition === "TRADE" && Boolean(intent) && !expired;
-  const canApprove = opportunity.source === "ALPACA_REAL" && ["TRADE", "PRE_SCAN_CANDIDATE"].includes(opportunity.disposition) && Boolean(intent) && Boolean(structure);
-  const approvalActive = approval?.state === "APPROVED_FOR_SESSION" || approval?.state === "REVALIDATING";
-
-  async function confirm() {
-    if (!intent) return;
-    setBusy(true);
-    try {
-      const order = await deskFetch<{ broker_order_id: string; status: string }>(`/desk/opportunities/${id}/confirm`, { method: "POST", body: JSON.stringify({ client_order_id: intent.client_order_id }) });
-      setMessage(`Paper order reconciled: ${order.broker_order_id} · ${order.status}`);
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Submission failed safely");
-    } finally {
-      setBusy(false);
-    }
-  }
+  const canApprove = opportunity.source === "ALPACA_REAL" && opportunity.disposition === "TRADE" && Boolean(intent) && Boolean(structure);
+  const canRenewApproval = !approval || ["EXPIRED", "CONDITION_FAILED", "REJECTED"].includes(approval.state);
+  const approvalCanReject = approval?.state === "APPROVED_FOR_SESSION";
 
   async function approveForSession() {
     if (!intent || !structure) return;
@@ -96,9 +84,9 @@ export function OrderReview({ id }: { id: string }) {
   }
 
   return <>
-    <div className={`mode-banner ${allowed ? "blue" : "danger"}`}>
-      {allowed ? <ShieldCheck /> : <AlertTriangle />}
-      <div><strong>{allowed ? "Real-source intent ready for operator review" : "This opportunity cannot be submitted"}</strong><span>{allowed ? "The immediate path re-runs all safety checks when you confirm." : opportunity.reason_codes.join(", ") || "No approved immutable intent is present."}</span></div>
+    <div className={`mode-banner ${canApprove ? "blue" : "danger"}`}>
+      {canApprove ? <ShieldCheck /> : <AlertTriangle />}
+      <div><strong>{canApprove ? "Real-source intent ready for conditional approval" : "This opportunity cannot be approved"}</strong><span>{canApprove ? "Approve for the next U.S. session; the worker revalidates every gate before paper submission." : opportunity.reason_codes.join(", ") || "No approved immutable intent is present."}</span></div>
     </div>
     <div className="review-grid">
       <section className="control-panel">
@@ -113,9 +101,7 @@ export function OrderReview({ id }: { id: string }) {
       <aside className="control-panel confirmation-panel">
         <Clock3 /><small>CONDITIONAL NEXT-SESSION APPROVAL</small>
         {approval ? <><strong>{approval.state.replaceAll("_", " ")}</strong><p>Session: {approval.session_date}<br />Maximum price: ${approval.max_limit_price}<br />Maximum loss: ${approval.max_loss}<br />Quote age: {approval.max_quote_age_seconds}s</p>{approval.failure_reason ? <p className="form-message">Reason: {approval.failure_reason}</p> : null}</> : <p>Approve once before sleep. At the next U.S. session open, the worker checks the live structure, quote, risk, and broker state before submitting.</p>}
-        {approvalActive ? <button className="secondary-button" disabled={busy} onClick={() => void rejectApproval()}>Reject approval</button> : <button disabled={!canApprove || busy} onClick={() => void approveForSession()}>Approve for next U.S. session</button>}
-        <hr />
-        <small>IMMEDIATE MANUAL SUBMISSION</small><code>{intent?.client_order_id ?? "No intent"}</code><p>Use this only when you are awake and want to submit now. It expires with the live opportunity.</p><label className="ack"><input type="checkbox" checked={ack} onChange={(event) => setAck(event.target.checked)} />I understand this sends an order to my Alpaca paper account using simulated funds.</label><button disabled={!allowed || !ack || busy} onClick={() => void confirm()}>{busy ? "Working…" : "Submit Paper Order Now"}</button><p className="microcopy">No unattended execution through this immediate button. Conditional approvals are separately revalidated by the worker.</p>
+        {approvalCanReject ? <button className="secondary-button" disabled={busy} onClick={() => void rejectApproval()}>Reject approval</button> : canRenewApproval ? <button disabled={!canApprove || busy} onClick={() => void approveForSession()}>Approve for next U.S. session</button> : null}
       </aside>
     </div>
     {message ? <p className="form-message">{message}</p> : null}

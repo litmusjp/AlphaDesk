@@ -96,5 +96,5 @@ jobs:
           enable-cache: true
       - run: uv sync --locked --all-groups
       - run: uv run alembic upgrade head
-      - run: uv run alembic downgrade base
+      - run: uv run alembic downgrade 20260917_0011
       - run: uv run alembic upgrade head

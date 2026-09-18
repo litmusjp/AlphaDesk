@@ -32,7 +32,7 @@ type Position = {
 
 type CloseAction = {
   symbol: string;
-  mode: "choose" | "now" | "next-session";
+  mode: "choose" | "next-session";
 };
 
 type Order = {
@@ -91,33 +91,15 @@ export function DeskPositions() {
   }, []);
 
   useEffect(() => {
-    refreshData();
+    const kickoff = setTimeout(() => {
+      void refreshData();
+    }, 0);
     const interval = setInterval(refreshData, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      clearTimeout(kickoff);
+      clearInterval(interval);
+    };
   }, [refreshData]);
-
-  async function handleClosePosition(symbol: string) {
-    setBusy(true);
-    setActionMessage(null);
-    try {
-      await deskFetch(`/desk/broker/positions/${encodeURIComponent(symbol)}/close`, {
-        method: "POST",
-      });
-      setActionMessage({
-        type: "success",
-        text: `Closing order for ${symbol} routed to Alpaca paper matching engine.`,
-      });
-      setCloseAction(null);
-      await refreshData();
-    } catch (e) {
-      setActionMessage({
-        type: "error",
-        text: e instanceof Error ? e.message : `Failed to close position for ${symbol}`,
-      });
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function handleApproveClose(position: Position) {
     setBusy(true);
@@ -204,7 +186,7 @@ export function DeskPositions() {
         >
           {actionMessage.type === "error" ? <XCircle /> : <CheckCircle2 />}
           <div>
-            <strong>{actionMessage.type === "error" ? "Execution Warning" : "Closing Order Submitted"}</strong>
+            <strong>{actionMessage.type === "error" ? "Approval Warning" : "Conditional Close Approval Recorded"}</strong>
             <span>{actionMessage.text}</span>
           </div>
         </div>
@@ -285,46 +267,17 @@ export function DeskPositions() {
                     selectedMode === "choose" ? (
                       <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
                         <span style={{ fontSize: "10px", color: "#5a6864" }}>Close position:</span>
-                        <div style={{ display: "flex", gap: "5px" }}>
-                          <button
-                            className="danger-button"
-                            style={{ fontSize: "11px", padding: "4px 8px" }}
-                            disabled={busy}
-                            onClick={() => setCloseAction({ symbol: p.symbol, mode: "now" })}
-                          >
-                            Now
-                          </button>
-                          <button
-                            className="secondary-button"
-                            style={{ fontSize: "10px", padding: "4px 7px" }}
-                            disabled={busy}
-                            onClick={() => setCloseAction({ symbol: p.symbol, mode: "next-session" })}
-                          >
-                            Pre-approve next session
-                          </button>
-                        </div>
+                        <button
+                          className="secondary-button"
+                          style={{ fontSize: "10px", padding: "4px 7px" }}
+                          disabled={busy}
+                          onClick={() => setCloseAction({ symbol: p.symbol, mode: "next-session" })}
+                        >
+                          Pre-approve next session
+                        </button>
                         <button
                           className="secondary-button"
                           style={{ fontSize: "10px", padding: "3px 7px", alignSelf: "flex-start" }}
-                          disabled={busy}
-                          onClick={() => setCloseAction(null)}
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    ) : selectedMode === "now" ? (
-                      <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                        <button
-                          className="danger-button"
-                          style={{ fontSize: "11px", padding: "4px 8px" }}
-                          disabled={busy}
-                          onClick={() => handleClosePosition(p.symbol)}
-                        >
-                          {busy ? "Closing…" : "Confirm"}
-                        </button>
-                        <button
-                          className="secondary-button"
-                          style={{ fontSize: "11px", padding: "4px 8px" }}
                           disabled={busy}
                           onClick={() => setCloseAction(null)}
                         >

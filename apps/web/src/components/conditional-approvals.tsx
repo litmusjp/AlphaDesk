@@ -60,9 +60,14 @@ export function ConditionalApprovals() {
   }, []);
 
   useEffect(() => {
-    refresh();
+    const kickoff = setTimeout(() => {
+      void refresh();
+    }, 0);
     const interval = setInterval(refresh, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      clearTimeout(kickoff);
+      clearInterval(interval);
+    };
   }, [refresh]);
 
   async function reject(approval: Approval) {
@@ -114,7 +119,7 @@ export function ConditionalApprovals() {
           <span>CONTRACT</span><span>ACTION</span><span>BOUND</span><span>QTY</span><span>NEXT SESSION / EXPIRY</span><span>STATE</span><span>ACTION</span>
         </header>
         {approvals.length ? approvals.map((approval) => {
-          const canReject = ["APPROVED_FOR_NEXT_SESSION", "REVALIDATING"].includes(approval.state);
+          const canReject = approval.state === "APPROVED_FOR_SESSION";
           return <div className="data-row" key={approval.approval_id} style={{ gridTemplateColumns: "1.3fr .65fr 1.35fr .9fr 1.4fr 1.1fr .7fr" }}>
             <div><strong>{approval.symbol}</strong><small style={{ color: "#707d79", fontSize: "9px", display: "block" }}>{approval.approval_kind === "CLOSE" ? `Position ${approval.position_side ?? "—"} · ${approval.position_asset_id ?? "—"}` : approval.structure_fingerprint}</small></div>
             <span className={`status-pill ${approval.approval_kind === "CLOSE" ? "warn" : ""}`}>{approval.approval_kind}</span>

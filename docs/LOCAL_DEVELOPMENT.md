@@ -183,10 +183,10 @@ cd ../..
 4. Click **Scan now**. Each row must show `ALPACA_REAL`; after-hours stale evidence may correctly produce `UNAVAILABLE` or `NO_TRADE`.
 5. Run another scan and verify the history panel separates the two scan runs instead of accumulating one undifferentiated table.
 6. Review an opportunity and run OpenRouter analysis. Provider failure must degrade only the AI panel.
-7. If a fresh approved bounded-risk candidate exists, review every leg and risk check, acknowledge, and explicitly submit one Alpaca paper order.
+7. If a fresh bounded-risk `TRADE` candidate exists, review every leg and risk check, then explicitly approve it for the next U.S. session. The worker revalidates the immutable intent, live quote, risk, account, and broker state before making one guarded Alpaca paper submission attempt.
 8. Verify broker-confirmed state in **Positions & Orders** and tenant-specific controls in **Audit & Guardian**.
 
-Paper submission is a real action against the operator's Alpaca paper account. Do not submit merely to make a failing scan appear successful.
+Conditional paper submission is a real action against the operator's Alpaca paper account and occurs only after the approved next-session checks. Do not approve merely to make a failing scan appear successful.
 
 ## 8. Troubleshooting
 
