@@ -92,10 +92,14 @@ def _maybe_create_order_intent(
     *,
     mode: ScanMode,
     create_intent: bool,
+    approved_intent: OrderIntent | None = None,
 ) -> OrderIntent | None:
     if mode is not ScanMode.EXECUTION or not create_intent or risk.decision != "APPROVE":
         return None
-    return create_order_intent(risk, candidate)
+    if approved_intent is not None:
+        return approved_intent
+    intent = create_order_intent(risk, candidate)
+    return intent
 
 
 class ConnectedOpportunityService:
@@ -190,7 +194,6 @@ class ConnectedOpportunityService:
         )
         return features, price, now
 
-
     async def analyze(
         self,
         symbol: str,
@@ -198,6 +201,7 @@ class ConnectedOpportunityService:
         scan_run_id: UUID | None = None,
         mode: ScanMode = ScanMode.EXECUTION,
         create_intent: bool = True,
+        approved_intent: OrderIntent | None = None,
     ) -> ConnectedAnalysis:
         normalized = symbol.strip().upper()
         if not normalized.isalnum() or len(normalized) > 16:
@@ -370,6 +374,7 @@ class ConnectedOpportunityService:
             candidate,
             mode=mode,
             create_intent=create_intent,
+            approved_intent=approved_intent,
         )
         pre_scan = mode is ScanMode.PRE_SCAN
         result = ConnectedAnalysis(

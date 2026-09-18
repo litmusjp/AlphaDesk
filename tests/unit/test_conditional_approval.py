@@ -2,14 +2,24 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import uuid4
 
+import pytest
+
+from packages.database.models import ConditionalApprovalRecord
+from packages.domain.broker import BrokerOrder, BrokerOrderLeg
 from packages.execution.conditional_approval import (
     ApprovalState,
     ConditionalApproval,
     ConditionalExitApproval,
     ExitOrderSide,
     RevalidationDecision,
+    approval_can_be_renewed,
+    approval_is_active,
     revalidate_exit_for_submission,
     revalidate_for_submission,
+)
+from packages.execution.conditional_store import (
+    _broker_evidence_is_valid,
+    _finish_transition_allowed,
 )
 
 
@@ -94,6 +104,46 @@ def test_revalidation_expires_outside_approved_session() -> None:
 
     assert result.decision is RevalidationDecision.EXPIRED
     assert result.reason == "approval_session_mismatch"
+
+
+def test_expired_approval_is_not_active_and_can_be_renewed() -> None:
+    now = datetime(2026, 9, 18, 14, 31, tzinfo=UTC)
+
+    assert not approval_is_active(
+        ApprovalState.APPROVED_FOR_SESSION,
+        datetime(2026, 9, 17, 20, 5, tzinfo=UTC),
+        now,
+    )
+    assert approval_can_be_renewed(ApprovalState.EXPIRED)
+
+
+def test_revalidating_approval_remains_active_and_cannot_be_renewed() -> None:
+    now = datetime(2026, 9, 18, 14, 31, tzinfo=UTC)
+
+    assert approval_is_active(ApprovalState.REVALIDATING, now - date.resolution, now)
+    assert not approval_can_be_renewed(ApprovalState.REVALIDATING)
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        ApprovalState.READY_TO_SUBMIT,
+        ApprovalState.SUBMITTED,
+        ApprovalState.PARTIALLY_FILLED,
+        ApprovalState.FILLED,
+        ApprovalState.SUBMISSION_UNCERTAIN,
+    ],
+)
+def test_execution_states_cannot_be_renewed(state: ApprovalState) -> None:
+    assert not approval_can_be_renewed(state)
+
+
+def test_terminal_state_cannot_be_downgraded_by_stale_worker() -> None:
+    assert not _finish_transition_allowed(ApprovalState.FILLED, ApprovalState.SUBMITTED)
+    assert not _finish_transition_allowed(
+        ApprovalState.SUBMISSION_UNCERTAIN, ApprovalState.CONDITION_FAILED
+    )
+    assert _finish_transition_allowed(ApprovalState.SUBMISSION_UNCERTAIN, ApprovalState.FILLED)
 
 
 def exit_approval(**overrides: object) -> ConditionalExitApproval:
@@ -183,3 +233,131 @@ def test_exit_revalidation_allows_short_position_buy_at_or_below_ceiling() -> No
     )
 
     assert result.decision is RevalidationDecision.READY_TO_SUBMIT
+
+
+def broker_record(**overrides: object) -> ConditionalApprovalRecord:
+    values: dict[str, object] = {
+        "approval_id": uuid4(),
+        "workspace_id": uuid4(),
+        "opportunity_id": uuid4(),
+        "approved_by_user_id": uuid4(),
+        "state": ApprovalState.REVALIDATING,
+        "approval_kind": "OPEN",
+        "session_date": date(2026, 9, 18),
+        "approved_at": datetime(2026, 9, 18, 12, tzinfo=UTC),
+        "expires_at": datetime(2026, 9, 19, tzinfo=UTC),
+        "client_order_id": "ad-test-order",
+        "structure_fingerprint": "QQQ260918C00500000:buy:1",
+        "approved_intent_payload": {"quantity": 1, "limit_price": "4.50"},
+        "approved_structure_identity": {"legs": []},
+        "approved_broker_account_id": "paper-account-1",
+        "max_limit_price": Decimal("4.50"),
+        "max_loss": Decimal("450"),
+        "max_quantity": 1,
+        "max_quote_age_seconds": 30,
+        "min_limit_price": None,
+        "position_asset_id": None,
+        "position_symbol": None,
+        "position_side": None,
+        "exit_order_side": None,
+        "broker_order_id": None,
+        "claimed_at": datetime(2026, 9, 18, 12, tzinfo=UTC),
+        "claim_token": uuid4(),
+        "submitted_at": None,
+        "failure_reason": None,
+        "created_at": datetime(2026, 9, 18, 12, tzinfo=UTC),
+        "updated_at": datetime(2026, 9, 18, 12, tzinfo=UTC),
+    }
+    values.update(overrides)
+    return ConditionalApprovalRecord(**values)
+
+
+def broker_order(**overrides: object) -> BrokerOrder:
+    values: dict[str, object] = {
+        "broker_order_id": "broker-1",
+        "client_order_id": "ad-test-order",
+        "status": "new",
+        "asset_class": "us_option",
+        "symbol": None,
+        "side": None,
+        "order_type": "limit",
+        "order_class": "mleg",
+        "time_in_force": "day",
+        "quantity": Decimal("1"),
+        "filled_quantity": Decimal("0"),
+        "filled_average_price": None,
+        "limit_price": Decimal("4.50"),
+        "submitted_at": datetime(2026, 9, 18, 12, tzinfo=UTC),
+        "created_at": datetime(2026, 9, 18, 12, tzinfo=UTC),
+        "updated_at": None,
+        "legs": (
+            BrokerOrderLeg(
+                broker_order_id="broker-1",
+                symbol="QQQ260918C00500000",
+                side="buy",
+                quantity=Decimal("1"),
+                filled_quantity=Decimal("0"),
+                status="new",
+            ),
+        ),
+        "broker_account_id": "paper-account-1",
+        "environment": "PAPER",
+    }
+    values.update(overrides)
+    return BrokerOrder(**values)
+
+
+def test_store_evidence_rejects_nonfinite_limit_price() -> None:
+    valid_order = broker_order()
+    malformed_order = BrokerOrder.model_construct(
+        **{**valid_order.__dict__, "limit_price": Decimal("Infinity")}
+    )
+    assert not _broker_evidence_is_valid(
+        broker_record(),
+        ApprovalState.SUBMITTED,
+        malformed_order,
+    )
+
+
+def test_store_evidence_rejects_price_above_approval_bound() -> None:
+    order = broker_order(limit_price=Decimal("4.51"))
+    assert not _broker_evidence_is_valid(
+        broker_record(),
+        ApprovalState.SUBMITTED,
+        order,
+    )
+
+
+def test_store_evidence_rejects_invalid_average_price_without_fill() -> None:
+    valid_order = broker_order()
+    malformed_order = BrokerOrder.model_construct(
+        **{
+            **valid_order.__dict__,
+            "filled_quantity": Decimal("0"),
+            "filled_average_price": Decimal("NaN"),
+        }
+    )
+    assert not _broker_evidence_is_valid(
+        broker_record(),
+        ApprovalState.SUBMITTED,
+        malformed_order,
+    )
+
+
+def test_store_evidence_preserves_a_full_terminal_fill() -> None:
+    order = broker_order(
+        status="canceled",
+        filled_quantity=Decimal("1"),
+        filled_average_price=Decimal("4.50"),
+        legs=(
+            BrokerOrderLeg(
+                broker_order_id="broker-1",
+                symbol="QQQ260918C00500000",
+                side="buy",
+                quantity=Decimal("1"),
+                filled_quantity=Decimal("1"),
+                status="canceled",
+            ),
+        ),
+    )
+    assert _broker_evidence_is_valid(broker_record(), ApprovalState.FILLED, order)

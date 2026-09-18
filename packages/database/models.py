@@ -182,7 +182,9 @@ class ConditionalApprovalRecord(Base):
             "workspace_id", "opportunity_id", name="uq_conditional_approval_opportunity"
         ),
         UniqueConstraint(
-            "workspace_id", "position_asset_id", "session_date",
+            "workspace_id",
+            "position_asset_id",
+            "session_date",
             name="uq_conditional_exit_position_session",
         ),
     )
@@ -209,6 +211,9 @@ class ConditionalApprovalRecord(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     client_order_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     structure_fingerprint: Mapped[str] = mapped_column(String(512))
+    approved_intent_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    approved_structure_identity: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    approved_broker_account_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     max_limit_price: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     max_loss: Mapped[Decimal] = mapped_column(Numeric(20, 8))
     max_quantity: Mapped[int] = mapped_column(Integer)
@@ -220,6 +225,7 @@ class ConditionalApprovalRecord(Base):
     exit_order_side: Mapped[str | None] = mapped_column(String(8))
     broker_order_id: Mapped[str | None] = mapped_column(String(128), index=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    claim_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True), index=True)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     failure_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

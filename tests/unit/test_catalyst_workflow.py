@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from packages.domain.broker import BrokerOrder, OrderSubmission
+from packages.domain.broker import BrokerOrder, BrokerOrderLeg, OrderSubmission
 from packages.domain.options import (
     Greeks,
     LegSide,
@@ -171,6 +171,19 @@ class FakeAdapter:
             order_class="mleg",
             time_in_force="day",
             filled_quantity=0,
+            limit_price=order.limit_price,
+            quantity=order.quantity,
+            legs=tuple(
+                BrokerOrderLeg(
+                    broker_order_id="broker-1",
+                    symbol=leg.symbol,
+                    side=leg.side,
+                    quantity=Decimal(leg.ratio),
+                    filled_quantity=Decimal("0"),
+                    status="new",
+                )
+                for leg in order.legs
+            ),
             created_at=now,
         )
 

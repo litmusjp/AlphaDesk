@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
 
@@ -26,6 +27,10 @@ class DuplicateSubmission(RuntimeError):
 
 
 class ExecutionBlocked(RuntimeError):
+    pass
+
+
+class SubmissionUncertain(TimeoutError):
     pass
 
 
@@ -60,6 +65,65 @@ class InMemoryIntentStore:
         return self.states.get(client_order_id)
 
 
+def _broker_order_matches_intent(
+    order: BrokerOrder, intent: OrderIntent, expected_broker_account_id: str | None
+) -> bool:
+    if expected_broker_account_id is not None and (
+        order.broker_account_id != expected_broker_account_id or order.environment != "PAPER"
+    ):
+        return False
+    if (
+        not order.broker_order_id
+        or order.client_order_id != intent.client_order_id
+        or order.asset_class != "us_option"
+        or order.order_type.lower() != "limit"
+        or order.order_class.lower() != "mleg"
+        or order.time_in_force.lower() != "day"
+        or order.quantity != Decimal(intent.quantity)
+        or order.limit_price != intent.limit_price
+        or len(order.legs) != len(intent.legs)
+    ):
+        return False
+    if not all(
+        leg.quantity is not None
+        and leg.quantity == Decimal(intent_leg.ratio)
+        and leg.symbol == intent_leg.symbol
+        and leg.side == intent_leg.side
+        for leg, intent_leg in zip(order.legs, intent.legs, strict=True)
+    ):
+        return False
+    if not order.filled_quantity.is_finite() or not (
+        Decimal("0") <= order.filled_quantity <= Decimal(intent.quantity)
+    ):
+        return False
+    if order.filled_average_price is not None and (
+        not order.filled_average_price.is_finite() or order.filled_average_price <= 0
+    ):
+        return False
+    if order.filled_quantity > 0 and order.filled_average_price is None:
+        return False
+    status = order.status.lower()
+    if status not in {
+        "new",
+        "accepted",
+        "pending_new",
+        "partially_filled",
+        "filled",
+        "rejected",
+        "canceled",
+        "expired",
+        "replaced",
+    }:
+        return False
+    if status in {"new", "accepted", "pending_new"}:
+        return order.filled_quantity == 0
+    if status == "filled":
+        return order.filled_quantity == Decimal(intent.quantity)
+    if status == "partially_filled":
+        return Decimal("0") < order.filled_quantity < Decimal(intent.quantity)
+    return True
+
+
 class ExecutionEngine:
     """The only application service authorized to submit through BrokerAdapter."""
 
@@ -74,7 +138,9 @@ class ExecutionEngine:
         self._store = store
         self._preflight = preflight
 
-    async def execute(self, intent: OrderIntent) -> BrokerOrder:
+    async def execute(
+        self, intent: OrderIntent, *, expected_broker_account_id: str | None = None
+    ) -> BrokerOrder:
         if self._preflight is not None:
             allowed, reason = await self._preflight.execution_allowed()
             if not allowed:
@@ -94,17 +160,51 @@ class ExecutionEngine:
         )
         try:
             order = await self._adapter.submit_order(submission)
-        except Exception:
-            await self._store.set_state(intent.client_order_id, ExecutionState.SUBMISSION_UNCERTAIN)
-            raise
-        await self._store.set_state(intent.client_order_id, ExecutionState.ACCEPTED)
+        except Exception as error:
+            try:
+                await self._store.set_state(
+                    intent.client_order_id, ExecutionState.SUBMISSION_UNCERTAIN
+                )
+            except Exception as state_error:
+                raise SubmissionUncertain(
+                    "submission uncertainty persistence failed"
+                ) from state_error
+            raise SubmissionUncertain("broker submission uncertain") from error
+        if not _broker_order_matches_intent(order, intent, expected_broker_account_id):
+            try:
+                await self._store.set_state(
+                    intent.client_order_id, ExecutionState.SUBMISSION_UNCERTAIN
+                )
+            except Exception as state_error:
+                raise SubmissionUncertain(
+                    "submission uncertainty persistence failed"
+                ) from state_error
+            raise SubmissionUncertain("broker response did not match approved intent")
+        try:
+            await self._store.set_state(intent.client_order_id, ExecutionState.ACCEPTED)
+        except Exception as error:
+            raise SubmissionUncertain("post-submit persistence uncertain") from error
         return order
 
-    async def reconcile_uncertain(self, intent: OrderIntent) -> BrokerOrder | None:
+    async def reconcile_uncertain(
+        self, intent: OrderIntent, *, expected_broker_account_id: str
+    ) -> BrokerOrder | None:
         state = await self._store.get_state(intent.client_order_id)
         if state is not ExecutionState.SUBMISSION_UNCERTAIN:
             raise ValueError("Only uncertain submissions may be reconciled")
         order = await self._adapter.get_order(client_order_id=intent.client_order_id)
         if order is not None:
+            if not _broker_order_matches_intent(
+                order, intent, expected_broker_account_id=expected_broker_account_id
+            ):
+                try:
+                    await self._store.set_state(
+                        intent.client_order_id, ExecutionState.SUBMISSION_UNCERTAIN
+                    )
+                except Exception as state_error:
+                    raise SubmissionUncertain(
+                        "submission uncertainty persistence failed"
+                    ) from state_error
+                raise SubmissionUncertain("recovered broker response did not match intent")
             await self._store.set_state(intent.client_order_id, ExecutionState.ACCEPTED)
         return order

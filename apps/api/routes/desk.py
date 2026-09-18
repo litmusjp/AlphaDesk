@@ -16,6 +16,7 @@ from anthropic import APITimeoutError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 
 from packages.ai.provider import AIProvider, AnthropicProvider, OpenRouterProvider
 from packages.ai.store import AIWorkflowStore
@@ -59,9 +60,13 @@ from packages.domain.workflow import OrderIntent, RankedCandidate
 from packages.execution.conditional_approval import (
     ApprovalState,
     ExitOrderSide,
+    approval_can_be_renewed,
+    approval_is_active,
+    candidate_structure_identity,
     order_structure_fingerprint,
 )
 from packages.execution.connected_paper import execute_connected_paper_order
+from packages.execution.engine import SubmissionUncertain
 from packages.guardian.store import PostgresGuardianStore
 from packages.observability.logging import get_logger
 from packages.security.store import CredentialStore
@@ -834,9 +839,7 @@ async def scan_now(
     failures: list[ScannerFailure] = []
     for symbol in symbols:
         try:
-            results.append(
-                await service.analyze(symbol, scan_run_id=run.scan_run_id, mode=mode)
-            )
+            results.append(await service.analyze(symbol, scan_run_id=run.scan_run_id, mode=mode))
         except Exception as error:
             logger.warning(
                 "workspace_scan_symbol_unavailable",
@@ -1152,9 +1155,7 @@ async def research_watchlist(
                 detail="Research scan could not be finalized",
             ) from error
 
-    by_symbol = {
-        result.symbol: result for result in results
-    }
+    by_symbol = {result.symbol: result for result in results}
     evidence = tuple(
         {
             "source_id": f"scan-{symbol}",
@@ -1322,8 +1323,14 @@ async def list_conditional_approvals(
                 select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
                 .outerjoin(
                     ConnectedOpportunityRecord,
-                    ConnectedOpportunityRecord.opportunity_id
-                    == ConditionalApprovalRecord.opportunity_id,
+                    (
+                        ConnectedOpportunityRecord.workspace_id
+                        == ConditionalApprovalRecord.workspace_id
+                    )
+                    & (
+                        ConnectedOpportunityRecord.opportunity_id
+                        == ConditionalApprovalRecord.opportunity_id
+                    ),
                 )
                 .where(ConditionalApprovalRecord.workspace_id == context.workspace_id)
                 .order_by(ConditionalApprovalRecord.created_at.desc())
@@ -1355,18 +1362,22 @@ async def approve_for_next_session(
         if opportunity_record is None:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         opportunity = ConnectedAnalysis.model_validate(opportunity_record.payload)
-        if opportunity.source != "ALPACA_REAL" or opportunity.disposition not in {
-            "TRADE",
-            "PRE_SCAN_CANDIDATE",
-        }:
+        if opportunity.source != "ALPACA_REAL" or opportunity.disposition != "TRADE":
             raise HTTPException(
                 status_code=409,
-                detail="Only executable or pre-scan candidate opportunities can be approved",
+                detail="Only execution-mode trade opportunities can be approved",
             )
         if opportunity.order_intent is None or opportunity.candidate is None:
             raise HTTPException(status_code=409, detail="Opportunity has no immutable order intent")
         intent = OrderIntent.model_validate(opportunity.order_intent)
         candidate = RankedCandidate.model_validate(opportunity.candidate)
+        broker_account = await session.scalar(
+            select(BrokerAccountRecord).where(
+                BrokerAccountRecord.workspace_id == context.workspace_id,
+            )
+        )
+        if broker_account is None:
+            raise HTTPException(status_code=409, detail="Paper broker account is not reconciled")
         max_limit_price = payload.max_limit_price or intent.limit_price
         max_loss = payload.max_loss or candidate.structure.max_loss
         max_quantity = payload.max_quantity or intent.quantity
@@ -1379,48 +1390,94 @@ async def approve_for_next_session(
                 status_code=422, detail="Maximum quantity is below the candidate quantity"
             )
         existing = await session.scalar(
-            select(ConditionalApprovalRecord).where(
+            select(ConditionalApprovalRecord)
+            .where(
                 ConditionalApprovalRecord.workspace_id == context.workspace_id,
                 ConditionalApprovalRecord.opportunity_id == opportunity_id,
-                ConditionalApprovalRecord.state.in_(
-                    (ApprovalState.APPROVED_FOR_SESSION, "REVALIDATING")
-                ),
             )
+            .with_for_update()
         )
+        approval_action = "CONDITIONAL_APPROVAL_CREATED"
         if existing is not None:
-            raise HTTPException(
-                status_code=409, detail="Opportunity already has an active approval"
+            if approval_is_active(existing.state, existing.expires_at, now):
+                raise HTTPException(
+                    status_code=409, detail="Opportunity already has an active approval"
+                )
+            if not (
+                approval_can_be_renewed(existing.state)
+                or (
+                    existing.state == ApprovalState.APPROVED_FOR_SESSION
+                    and existing.expires_at <= now
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Opportunity already has a submitted or unresolved approval",
+                )
+            record = existing
+            record.approved_by_user_id = context.principal.user_id
+            record.state = ApprovalState.APPROVED_FOR_SESSION
+            record.approval_kind = "OPEN"
+            record.session_date = session_date
+            record.approved_at = now
+            record.expires_at = expires_at
+            record.client_order_id = intent.client_order_id
+            record.structure_fingerprint = order_structure_fingerprint(intent)
+            record.approved_intent_payload = intent.model_dump(mode="json")
+            record.approved_structure_identity = candidate_structure_identity(candidate)
+            record.approved_broker_account_id = broker_account.account_id
+            record.max_limit_price = max_limit_price
+            record.max_loss = max_loss
+            record.max_quantity = max_quantity
+            record.max_quote_age_seconds = payload.max_quote_age_seconds
+            record.broker_order_id = None
+            record.failure_reason = None
+            record.claimed_at = None
+            record.claim_token = None
+            record.submitted_at = None
+            record.updated_at = now
+            approval_action = "CONDITIONAL_APPROVAL_RENEWED"
+        else:
+            record = ConditionalApprovalRecord(
+                approval_id=uuid4(),
+                workspace_id=context.workspace_id,
+                opportunity_id=opportunity_id,
+                approved_by_user_id=context.principal.user_id,
+                state=ApprovalState.APPROVED_FOR_SESSION,
+                approval_kind="OPEN",
+                session_date=session_date,
+                approved_at=now,
+                expires_at=expires_at,
+                client_order_id=intent.client_order_id,
+                structure_fingerprint=order_structure_fingerprint(intent),
+                approved_intent_payload=intent.model_dump(mode="json"),
+                approved_structure_identity=candidate_structure_identity(candidate),
+                approved_broker_account_id=broker_account.account_id,
+                max_limit_price=max_limit_price,
+                max_loss=max_loss,
+                max_quantity=max_quantity,
+                max_quote_age_seconds=payload.max_quote_age_seconds,
+                broker_order_id=None,
+                failure_reason=None,
+                claimed_at=None,
+                submitted_at=None,
+                created_at=now,
+                updated_at=now,
             )
-        record = ConditionalApprovalRecord(
-            approval_id=uuid4(),
-            workspace_id=context.workspace_id,
-            opportunity_id=opportunity_id,
-            approved_by_user_id=context.principal.user_id,
-            state=ApprovalState.APPROVED_FOR_SESSION,
-            approval_kind="OPEN",
-            session_date=session_date,
-            approved_at=now,
-            expires_at=expires_at,
-            client_order_id=intent.client_order_id,
-            structure_fingerprint=order_structure_fingerprint(intent),
-            max_limit_price=max_limit_price,
-            max_loss=max_loss,
-            max_quantity=max_quantity,
-            max_quote_age_seconds=payload.max_quote_age_seconds,
-            broker_order_id=None,
-            failure_reason=None,
-            claimed_at=None,
-            submitted_at=None,
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(record)
+            session.add(record)
+        try:
+            await session.flush()
+        except IntegrityError as error:
+            raise HTTPException(
+                status_code=409,
+                detail="Opportunity already has an approval",
+            ) from error
         session.add(
             AuditRecord(
                 audit_id=uuid4(),
                 workspace_id=context.workspace_id,
                 actor_user_id=context.principal.user_id,
-                action="CONDITIONAL_APPROVAL_CREATED",
+                action=approval_action,
                 detail={
                     "approval_id": str(record.approval_id),
                     "opportunity_id": str(opportunity_id),
@@ -1483,60 +1540,119 @@ async def approve_position_close_for_next_session(
         )
     order_side = ExitOrderSide.SELL if position.side == "long" else ExitOrderSide.BUY
     bound = payload.limit_price_bound or position.current_price
+    expected_order_side = order_side.value
+    terminal_order_statuses = {"filled", "canceled", "expired", "rejected", "replaced"}
+    if any(
+        order.symbol == position.symbol
+        and order.side == expected_order_side
+        and order.status.lower() not in terminal_order_statuses
+        for order in snapshot.open_orders
+    ):
+        raise HTTPException(
+            status_code=409, detail="This exact position already has an open broker close order"
+        )
     now = datetime.now(UTC)
     async with request.app.state.database.sessions.begin() as session:
         existing = await session.scalar(
-            select(ConditionalApprovalRecord).where(
+            select(ConditionalApprovalRecord)
+            .where(
                 ConditionalApprovalRecord.workspace_id == context.workspace_id,
                 ConditionalApprovalRecord.approval_kind == "CLOSE",
                 ConditionalApprovalRecord.position_asset_id == position.asset_id,
-                ConditionalApprovalRecord.state.in_((
-                    ApprovalState.APPROVED_FOR_SESSION,
-                    ApprovalState.REVALIDATING,
-                )),
+                ConditionalApprovalRecord.session_date == session_date,
             )
+            .with_for_update()
         )
         if existing is not None:
-            raise HTTPException(
-                status_code=409, detail="This exact position already has an active close approval"
-            )
-        record = ConditionalApprovalRecord(
-            approval_id=uuid4(),
-            workspace_id=context.workspace_id,
-            opportunity_id=None,
-            approved_by_user_id=context.principal.user_id,
-            state=ApprovalState.APPROVED_FOR_SESSION,
-            approval_kind="CLOSE",
-            session_date=session_date,
-            approved_at=now,
-            expires_at=expires_at,
-            client_order_id=f"ad-exit-{uuid4().hex}",
-            structure_fingerprint=(
+            if approval_is_active(existing.state, existing.expires_at, now):
+                raise HTTPException(
+                    status_code=409,
+                    detail="This exact position already has an active close approval",
+                )
+            if not (
+                approval_can_be_renewed(existing.state)
+                or (
+                    existing.state == ApprovalState.APPROVED_FOR_SESSION
+                    and existing.expires_at <= now
+                )
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This exact position already has a submitted or unresolved close approval"
+                    ),
+                )
+            record = existing
+            record.approved_by_user_id = context.principal.user_id
+            record.approved_broker_account_id = snapshot.account.account_id
+            record.state = ApprovalState.APPROVED_FOR_SESSION
+            record.approved_at = now
+            record.expires_at = expires_at
+            record.client_order_id = f"ad-exit-{uuid4().hex}"
+            record.structure_fingerprint = (
                 f"EXIT:{position.asset_id}:{position.symbol}:{position.side}:{quantity}"
-            ),
-            max_limit_price=bound if order_side is ExitOrderSide.BUY else Decimal("0"),
-            min_limit_price=bound if order_side is ExitOrderSide.SELL else None,
-            max_loss=Decimal("0"),
-            max_quantity=int(quantity),
-            max_quote_age_seconds=payload.max_quote_age_seconds,
-            position_asset_id=position.asset_id,
-            position_symbol=position.symbol,
-            position_side=position.side,
-            exit_order_side=order_side.value,
-            broker_order_id=None,
-            failure_reason=None,
-            claimed_at=None,
-            submitted_at=None,
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(record)
+            )
+            record.max_limit_price = bound if order_side is ExitOrderSide.BUY else Decimal("0")
+            record.min_limit_price = bound if order_side is ExitOrderSide.SELL else None
+            record.max_quantity = int(quantity)
+            record.max_quote_age_seconds = payload.max_quote_age_seconds
+            record.position_symbol = position.symbol
+            record.position_side = position.side
+            record.exit_order_side = order_side.value
+            record.broker_order_id = None
+            record.failure_reason = None
+            record.claimed_at = None
+            record.claim_token = None
+            record.submitted_at = None
+            record.updated_at = now
+            approval_action = "CONDITIONAL_EXIT_APPROVAL_RENEWED"
+        else:
+            record = ConditionalApprovalRecord(
+                approval_id=uuid4(),
+                workspace_id=context.workspace_id,
+                opportunity_id=None,
+                approved_by_user_id=context.principal.user_id,
+                approved_broker_account_id=snapshot.account.account_id,
+                state=ApprovalState.APPROVED_FOR_SESSION,
+                approval_kind="CLOSE",
+                session_date=session_date,
+                approved_at=now,
+                expires_at=expires_at,
+                client_order_id=f"ad-exit-{uuid4().hex}",
+                structure_fingerprint=(
+                    f"EXIT:{position.asset_id}:{position.symbol}:{position.side}:{quantity}"
+                ),
+                max_limit_price=bound if order_side is ExitOrderSide.BUY else Decimal("0"),
+                min_limit_price=bound if order_side is ExitOrderSide.SELL else None,
+                max_loss=Decimal("0"),
+                max_quantity=int(quantity),
+                max_quote_age_seconds=payload.max_quote_age_seconds,
+                position_asset_id=position.asset_id,
+                position_symbol=position.symbol,
+                position_side=position.side,
+                exit_order_side=order_side.value,
+                broker_order_id=None,
+                failure_reason=None,
+                claimed_at=None,
+                claim_token=None,
+                submitted_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(record)
+            approval_action = "CONDITIONAL_EXIT_APPROVAL_CREATED"
+        try:
+            await session.flush()
+        except IntegrityError as error:
+            raise HTTPException(
+                status_code=409, detail="This exact position already has a close approval"
+            ) from error
         session.add(
             AuditRecord(
                 audit_id=uuid4(),
                 workspace_id=context.workspace_id,
                 actor_user_id=context.principal.user_id,
-                action="CONDITIONAL_EXIT_APPROVAL_CREATED",
+                action=approval_action,
                 detail={
                     "approval_id": str(record.approval_id),
                     "position_asset_id": position.asset_id,
@@ -1561,8 +1677,11 @@ async def reject_conditional_approval(
             select(ConditionalApprovalRecord, ConnectedOpportunityRecord.symbol)
             .outerjoin(
                 ConnectedOpportunityRecord,
-                ConnectedOpportunityRecord.opportunity_id
-                == ConditionalApprovalRecord.opportunity_id,
+                (ConnectedOpportunityRecord.workspace_id == ConditionalApprovalRecord.workspace_id)
+                & (
+                    ConnectedOpportunityRecord.opportunity_id
+                    == ConditionalApprovalRecord.opportunity_id
+                ),
             )
             .where(
                 ConditionalApprovalRecord.workspace_id == context.workspace_id,
@@ -1574,8 +1693,11 @@ async def reject_conditional_approval(
         if result is None:
             raise HTTPException(status_code=404, detail="Approval not found")
         record, symbol = result
-        if record.state in (ApprovalState.SUBMITTED, "FILLED"):
-            raise HTTPException(status_code=409, detail="Submitted approvals cannot be rejected")
+        if record.state != ApprovalState.APPROVED_FOR_SESSION:
+            raise HTTPException(
+                status_code=409,
+                detail="Only an active approval can be rejected",
+            )
         record.state = ApprovalState.REJECTED
         record.failure_reason = "operator_rejected"
         record.updated_at = now
@@ -1668,6 +1790,10 @@ async def confirm_paper_order(
     request: Request,
     context: WorkspaceContext = Depends(require_workspace),
 ) -> BrokerOrder:
+    raise HTTPException(
+        status_code=409,
+        detail="Direct confirmation is disabled; review and approve the conditional order first",
+    )
     async with request.app.state.database.sessions() as session:
         record = await session.scalar(
             select(ConnectedOpportunityRecord).where(
@@ -1706,7 +1832,7 @@ async def confirm_paper_order(
             candidate=candidate,
             intent=intent,
         )
-    except RuntimeError as error:
+    except (RuntimeError, SubmissionUncertain) as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
 
@@ -1741,6 +1867,10 @@ async def close_position(
     request: Request,
     context: WorkspaceContext = Depends(require_workspace),
 ) -> BrokerOrder:
+    raise HTTPException(
+        status_code=409,
+        detail="Immediate closes are disabled; create and approve a conditional option close first",
+    )
     secrets = await _credential_store(request).reveal(context.workspace_id, "ALPACA")
     if secrets is None:
         raise HTTPException(status_code=409, detail="Alpaca credential unavailable")
@@ -1760,8 +1890,7 @@ async def close_position(
             )
         elif "position not found" in detail:
             detail = (
-                f"Position {symbol_or_asset_id} is already closed or does not exist "
-                "on the broker."
+                f"Position {symbol_or_asset_id} is already closed or does not exist on the broker."
             )
         raise HTTPException(status_code=400, detail=detail) from error
     except Exception as error:

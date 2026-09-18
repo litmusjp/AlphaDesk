@@ -51,7 +51,7 @@ def test_connected_stock_requests_explicitly_use_iex_feed() -> None:
     assert stock.bars_request.feed is DataFeed.IEX
 
 
-def test_research_mode_never_creates_order_intent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_non_intent_scan_never_creates_order_intent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "packages.connected.opportunities.create_order_intent",
         lambda *_args, **_kwargs: pytest.fail("research must not create an order intent"),

@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "fix/**", "refactor/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests and checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - run: uv run ruff format --check apps/api/routes/desk.py apps/worker/__main__.py packages/connected/opportunities.py packages/execution/conditional_approval.py packages/execution/conditional_store.py packages/execution/conditional_runner.py packages/execution/conditional_exit_runner.py packages/execution/engine.py packages/execution/connected_paper.py packages/broker/alpaca_adapter.py packages/domain/broker.py packages/database/models.py migrations/versions/20260918_0012_claim_fencing.py tests/unit/test_conditional_approval.py tests/unit/test_catalyst_workflow.py tests/unit/test_connected_opportunities.py
+      - run: uv run ruff check apps/api/routes/desk.py apps/worker/__main__.py packages/connected/opportunities.py packages/execution/conditional_approval.py packages/execution/conditional_store.py packages/execution/conditional_runner.py packages/execution/conditional_exit_runner.py packages/execution/engine.py packages/execution/connected_paper.py packages/broker/alpaca_adapter.py packages/domain/broker.py packages/database/models.py migrations/versions/20260918_0012_claim_fencing.py tests/unit/test_conditional_approval.py tests/unit/test_catalyst_workflow.py tests/unit/test_connected_opportunities.py
+      - run: uv run mypy apps/api/routes/desk.py apps/worker/__main__.py packages/connected/opportunities.py packages/execution/conditional_approval.py packages/execution/conditional_store.py packages/execution/conditional_runner.py packages/execution/conditional_exit_runner.py packages/execution/engine.py packages/execution/connected_paper.py packages/broker/alpaca_adapter.py packages/domain/broker.py packages/database/models.py
+      - run: uv run pytest
+      - run: uv export --format requirements-txt --no-dev --no-emit-project --no-hashes --output-file /tmp/alphadesk-requirements.txt
+      - run: uvx --with pip-audit pip-audit --strict -r /tmp/alphadesk-requirements.txt
+
+  web:
+    name: Web tests and build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm audit --prod --audit-level=high
+
+  secrets:
+    name: Secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  workflow:
+    name: Workflow validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://rhysd/actionlint:1.7.7
+
+  migrations:
+    name: Migration upgrade and downgrade
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: alphadesk
+          POSTGRES_PASSWORD: alphadesk_dev
+          POSTGRES_DB: alphadesk
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U alphadesk -d alphadesk"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - run: uv run alembic upgrade head
+      - run: uv run alembic downgrade base
+      - run: uv run alembic upgrade head

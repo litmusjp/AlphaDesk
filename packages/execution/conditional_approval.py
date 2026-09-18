@@ -6,7 +6,7 @@ from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID
 
-from packages.domain.workflow import OrderIntent
+from packages.domain.workflow import OrderIntent, RankedCandidate
 
 
 class ApprovalState(StrEnum):
@@ -32,6 +32,21 @@ class RevalidationDecision(StrEnum):
     READY_TO_SUBMIT = "READY_TO_SUBMIT"
     CONDITION_FAILED = "CONDITION_FAILED"
     EXPIRED = "EXPIRED"
+
+
+def approval_is_active(state: ApprovalState | str, expires_at: datetime, now: datetime) -> bool:
+    normalized_state = ApprovalState(state)
+    if normalized_state is ApprovalState.REVALIDATING:
+        return True
+    return normalized_state is ApprovalState.APPROVED_FOR_SESSION and expires_at > now
+
+
+def approval_can_be_renewed(state: ApprovalState | str) -> bool:
+    return ApprovalState(state) in {
+        ApprovalState.EXPIRED,
+        ApprovalState.CONDITION_FAILED,
+        ApprovalState.REJECTED,
+    }
 
 
 @dataclass(frozen=True)
@@ -75,6 +90,23 @@ class RevalidationResult:
     reason: str | None = None
 
 
+def candidate_structure_identity(candidate: RankedCandidate) -> dict[str, object]:
+    structure = candidate.structure
+    return {
+        "structure_type": structure.structure_type.value,
+        "quantity": structure.quantity,
+        "underlying": structure.underlying.symbol if structure.underlying is not None else None,
+        "legs": [
+            {
+                "symbol": leg.contract.symbol,
+                "side": leg.side.value,
+                "ratio": leg.ratio,
+            }
+            for leg in structure.legs
+        ],
+    }
+
+
 def order_structure_fingerprint(intent: OrderIntent) -> str:
     return "|".join(f"{leg.symbol}:{leg.side}:{leg.ratio}" for leg in intent.legs)
 
@@ -106,7 +138,7 @@ def revalidate_for_submission(
         )
     if quote_age_seconds < 0 or quote_age_seconds > approval.max_quote_age_seconds:
         return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "quote_stale")
-    if _invalid_decimal(limit_price) or limit_price > approval.max_limit_price:
+    if _invalid_decimal(limit_price) or limit_price <= 0 or limit_price > approval.max_limit_price:
         return RevalidationResult(
             RevalidationDecision.CONDITION_FAILED, "limit_price_exceeds_approval"
         )
@@ -145,7 +177,7 @@ def revalidate_exit_for_submission(
         return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "position_changed")
     if quote_age_seconds < 0 or quote_age_seconds > approval.max_quote_age_seconds:
         return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "quote_stale")
-    if _invalid_decimal(limit_price):
+    if _invalid_decimal(limit_price) or limit_price <= 0:
         return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "limit_price_invalid")
     if approval.order_side is ExitOrderSide.SELL:
         if limit_price < approval.limit_price_bound:
@@ -153,7 +185,5 @@ def revalidate_exit_for_submission(
                 RevalidationDecision.CONDITION_FAILED, "exit_limit_below_floor"
             )
     elif limit_price > approval.limit_price_bound:
-        return RevalidationResult(
-            RevalidationDecision.CONDITION_FAILED, "exit_limit_above_ceiling"
-        )
+        return RevalidationResult(RevalidationDecision.CONDITION_FAILED, "exit_limit_above_ceiling")
     return RevalidationResult(RevalidationDecision.READY_TO_SUBMIT)

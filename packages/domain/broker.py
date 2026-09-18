@@ -89,6 +89,8 @@ class BrokerOrder(BaseModel):
     created_at: datetime
     updated_at: datetime | None = None
     legs: tuple[BrokerOrderLeg, ...] = ()
+    broker_account_id: str | None = None
+    environment: str | None = None
 
 
 class BrokerTradeUpdate(BaseModel):

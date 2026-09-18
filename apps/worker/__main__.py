@@ -30,6 +30,7 @@ from packages.database.session import Database
 from packages.event_bus.client import JetStreamEventBus
 from packages.execution.conditional_exit_runner import process_workspace_exit_approvals
 from packages.execution.conditional_runner import process_workspace_approvals
+from packages.execution.conditional_store import ConditionalApprovalStore
 from packages.observability.logging import configure_logging, get_logger
 from packages.security.credentials import CredentialCipher, CredentialConfigurationError
 from packages.security.store import CredentialStore
@@ -43,6 +44,31 @@ async def _wait_or_stop(stop: asyncio.Event, seconds: float) -> bool:
     except TimeoutError:
         return False
     return True
+
+
+async def _approval_expiry_supervisor(database: Database, stop: asyncio.Event) -> None:
+    store = ConditionalApprovalStore(database)
+    while not stop.is_set():
+        try:
+            now = datetime.now(UTC)
+            reclaimed = await store.reclaim_all_stale_revalidating(now=now)
+            expired = await store.expire_all_before(now=now)
+            if reclaimed or expired:
+                logger.info(
+                    "conditional_approvals_lifecycle_maintained",
+                    extra={
+                        "event": "conditional_approvals_lifecycle_maintained",
+                        "reclaimed": reclaimed,
+                        "expired": expired,
+                    },
+                )
+        except Exception:
+            logger.exception(
+                "conditional_approval_expiry_failed",
+                extra={"event": "conditional_approval_expiry_failed"},
+            )
+        if await _wait_or_stop(stop, 30):
+            return
 
 
 async def _periodic_reconciliation(
@@ -200,9 +226,7 @@ def _market_is_open(now: datetime) -> bool:
     return eastern.weekday() < 5 and 570 <= minutes < 960
 
 
-async def _alpaca_market_is_open(
-    credential_store: CredentialStore, workspace_id: UUID
-) -> bool:
+async def _alpaca_market_is_open(credential_store: CredentialStore, workspace_id: UUID) -> bool:
     secret = await credential_store.reveal(workspace_id, "ALPACA")
     if secret is None:
         return False
@@ -436,6 +460,9 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
+    expiry_task = asyncio.create_task(
+        _approval_expiry_supervisor(database, stop), name="conditional-approval-expiry"
+    )
     try:
         if settings.infrastructure_checks:
             await database.ping()
@@ -468,8 +495,11 @@ async def run() -> None:
             ),
             _scanner_supervisor(database, cipher, stop),
             _pre_session_supervisor(database, cipher, stop),
+            expiry_task,
         )
     finally:
+        expiry_task.cancel()
+        await asyncio.gather(expiry_task, return_exceptions=True)
         await event_bus.close()
         await database.close()
         logger.info("worker_stopped", extra={"event": "worker_stopped"})

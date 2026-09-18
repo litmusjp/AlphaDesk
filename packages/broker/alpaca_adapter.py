@@ -155,6 +155,12 @@ class AlpacaPaperBrokerAdapter:
             occurred_at=_required_datetime(raw.timestamp),
         )
 
+    async def _attach_execution_identity(self, order: BrokerOrder) -> BrokerOrder:
+        account = await self.get_account()
+        return order.model_copy(
+            update={"broker_account_id": account.account_id, "environment": "PAPER"}
+        )
+
     async def get_account(self) -> BrokerAccount:
         raw = await asyncio.to_thread(self._client.get_account)
         return self._map_account(raw)
@@ -164,7 +170,7 @@ class AlpacaPaperBrokerAdapter:
         return tuple(self._map_position(position) for position in raw)
 
     async def list_open_orders(self) -> tuple[BrokerOrder, ...]:
-        request = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=50, nested=True)
+        request = GetOrdersRequest(status=QueryOrderStatus.ALL, nested=True)
         raw = await asyncio.to_thread(self._client.get_orders, request)
         return tuple(self._map_order(order) for order in raw)
 
@@ -185,14 +191,14 @@ class AlpacaPaperBrokerAdapter:
             ],
         )
         raw = await asyncio.to_thread(self._client.submit_order, request)
-        return self._map_order(raw)
+        return await self._attach_execution_identity(self._map_order(raw))
 
     async def cancel_order(self, broker_order_id: str) -> None:
         await asyncio.to_thread(self._client.cancel_order_by_id, broker_order_id)
 
     async def close_position(self, symbol_or_asset_id: str) -> BrokerOrder:
         raw = await asyncio.to_thread(self._client.close_position, symbol_or_asset_id)
-        return self._map_order(raw)
+        return await self._attach_execution_identity(self._map_order(raw))
 
     async def submit_close_limit(
         self,
@@ -222,7 +228,7 @@ class AlpacaPaperBrokerAdapter:
             client_order_id=client_order_id,
         )
         raw = await asyncio.to_thread(self._client.submit_order, request)
-        return self._map_order(raw)
+        return await self._attach_execution_identity(self._map_order(raw))
 
     async def get_order(
         self,
@@ -242,7 +248,7 @@ class AlpacaPaperBrokerAdapter:
             if getattr(error, "status_code", None) == 404:
                 return None
             raise
-        return self._map_order(raw)
+        return await self._attach_execution_identity(self._map_order(raw))
 
     async def reconcile(self) -> ReconciliationSnapshot:
         account = await self.get_account()
