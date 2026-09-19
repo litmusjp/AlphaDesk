@@ -15,7 +15,7 @@ from alpaca.common.exceptions import APIError
 from anthropic import APITimeoutError
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from packages.ai.provider import (
@@ -897,7 +897,10 @@ async def list_scan_runs(
         records = list(
             await session.scalars(
                 select(ConnectedScanRunRecord)
-                .where(ConnectedScanRunRecord.workspace_id == context.workspace_id)
+                .where(
+                    ConnectedScanRunRecord.workspace_id == context.workspace_id,
+                    ConnectedScanRunRecord.trigger != "AI_RESEARCH",
+                )
                 .order_by(ConnectedScanRunRecord.started_at.desc())
                 .limit(10)
             )
@@ -928,6 +931,7 @@ async def get_scan_run_results(
             select(ConnectedScanRunRecord.scan_run_id).where(
                 ConnectedScanRunRecord.scan_run_id == scan_run_id,
                 ConnectedScanRunRecord.workspace_id == context.workspace_id,
+                ConnectedScanRunRecord.trigger != "AI_RESEARCH",
             )
         )
         if owned_run is None:
@@ -1307,7 +1311,17 @@ async def list_opportunities(
     async with request.app.state.database.sessions() as session:
         records = await session.scalars(
             select(ConnectedOpportunityRecord)
-            .where(ConnectedOpportunityRecord.workspace_id == context.workspace_id)
+            .outerjoin(
+                ConnectedScanRunRecord,
+                ConnectedScanRunRecord.scan_run_id == ConnectedOpportunityRecord.scan_run_id,
+            )
+            .where(
+                ConnectedOpportunityRecord.workspace_id == context.workspace_id,
+                or_(
+                    ConnectedScanRunRecord.trigger.is_(None),
+                    ConnectedScanRunRecord.trigger != "AI_RESEARCH",
+                ),
+            )
             .order_by(ConnectedOpportunityRecord.created_at.desc())
             .limit(50)
         )
@@ -1322,9 +1336,18 @@ async def get_opportunity(
 ) -> ConnectedAnalysis:
     async with request.app.state.database.sessions() as session:
         record = await session.scalar(
-            select(ConnectedOpportunityRecord).where(
+            select(ConnectedOpportunityRecord)
+            .outerjoin(
+                ConnectedScanRunRecord,
+                ConnectedScanRunRecord.scan_run_id == ConnectedOpportunityRecord.scan_run_id,
+            )
+            .where(
                 ConnectedOpportunityRecord.workspace_id == context.workspace_id,
                 ConnectedOpportunityRecord.opportunity_id == opportunity_id,
+                or_(
+                    ConnectedScanRunRecord.trigger.is_(None),
+                    ConnectedScanRunRecord.trigger != "AI_RESEARCH",
+                ),
             )
         )
     if record is None:

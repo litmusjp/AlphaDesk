@@ -183,37 +183,51 @@ class OpenRouterProvider:
         response_model: type[ResponseT],
     ) -> ResponseT:
         schema_name = "".join(character for character in agent_name if character.isalnum())[:48]
-        response = await asyncio.wait_for(
-            self._client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": instructions + "\nReturn only the required JSON object.",
+        for attempt, max_tokens in enumerate((2000, 4000)):
+            response = await asyncio.wait_for(
+                self._client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": instructions + "\nReturn only the required JSON object.",
+                        },
+                        {"role": "user", "content": input_payload},
+                    ],
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name or "AlphaDeskResponse",
+                            "strict": True,
+                            "schema": response_model.model_json_schema(),
+                        },
                     },
-                    {"role": "user", "content": input_payload},
-                ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_name or "AlphaDeskResponse",
-                        "strict": True,
-                        "schema": response_model.model_json_schema(),
+                    max_tokens=max_tokens,
+                    temperature=0,
+                    extra_body={
+                        "provider": {"require_parameters": True},
+                        "plugins": [{"id": "response-healing"}],
                     },
-                },
-                max_tokens=2000,
-                temperature=0,
-                extra_body={
-                    "provider": {"require_parameters": True},
-                    "plugins": [{"id": "response-healing"}],
-                },
-            ),
-            timeout=self._timeout,
+                ),
+                timeout=self._timeout,
+            )
+            finish_reason = getattr(response.choices[0], "finish_reason", None)
+            content = response.choices[0].message.content
+            if attempt == 0 and finish_reason in {"length", "max_tokens"}:
+                continue
+            if not content:
+                raise ValueError(f"{agent_name} returned no structured output")
+            try:
+                return _validate_structured_output(
+                    response_model, _decode_structured_content(content)
+                )
+            except (StructuredOutputError, ValueError):
+                if attempt == 0 and finish_reason in {"length", "max_tokens"}:
+                    continue
+                raise
+        raise StructuredOutputError(
+            "Provider returned schema-invalid structured output", stop_reason="max_tokens"
         )
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError(f"{agent_name} returned no structured output")
-        return _validate_structured_output(response_model, _decode_structured_content(content))
 
 
 class AnthropicProvider:
@@ -246,28 +260,49 @@ class AnthropicProvider:
         response_model: type[ResponseT],
     ) -> ResponseT:
         tool_name = "".join(character for character in agent_name if character.isalnum())[:48]
-        response = await asyncio.wait_for(
-            self._client.messages.create(
-                model=self.model,
-                max_tokens=5000,
-                system=instructions,
-                messages=[{"role": "user", "content": input_payload}],
-                tools=[
-                    {
-                        "name": tool_name or "AlphaDeskResponse",
-                        "description": "Return the required AlphaDesk structured response.",
-                        "input_schema": response_model.model_json_schema(),
-                    }
-                ],
-                tool_choice={"type": "tool", "name": tool_name or "AlphaDeskResponse"},
-            ),
-            timeout=self._timeout,
+        for attempt, max_tokens in enumerate((5000, 8000)):
+            retry_instructions = (
+                instructions
+                if attempt == 0
+                else instructions
+                + "\nBe concise: summary <= 240 characters, at most 3 limitations, "
+                + "at most 5 recommendations, at most 3 risks per recommendation, "
+                + "and return every required field exactly once."
+            )
+            response = await asyncio.wait_for(
+                self._client.messages.create(
+                    model=self.model,
+                    max_tokens=max_tokens,
+                    system=retry_instructions,
+                    messages=[{"role": "user", "content": input_payload}],
+                    tools=[
+                        {
+                            "name": tool_name or "AlphaDeskResponse",
+                            "description": "Return the required AlphaDesk structured response.",
+                            "input_schema": response_model.model_json_schema(),
+                        }
+                    ],
+                    tool_choice={"type": "tool", "name": tool_name or "AlphaDeskResponse"},
+                ),
+                timeout=self._timeout,
+            )
+            for block in response.content:
+                if getattr(block, "type", None) == "tool_use":
+                    try:
+                        return _validate_structured_output(
+                            response_model,
+                            getattr(block, "input", None),
+                            stop_reason=getattr(response, "stop_reason", None),
+                        )
+                    except StructuredOutputError as error:
+                        if attempt == 0 and error.stop_reason == "max_tokens":
+                            break
+                        raise
+            else:
+                if attempt == 0 and getattr(response, "stop_reason", None) == "max_tokens":
+                    continue
+                raise ValueError(f"{agent_name} returned no structured output")
+        raise StructuredOutputError(
+            "Provider returned schema-invalid structured output",
+            stop_reason="max_tokens",
         )
-        for block in response.content:
-            if getattr(block, "type", None) == "tool_use":
-                return _validate_structured_output(
-                    response_model,
-                    getattr(block, "input", None),
-                    stop_reason=getattr(response, "stop_reason", None),
-                )
-        raise ValueError(f"{agent_name} returned no structured output")

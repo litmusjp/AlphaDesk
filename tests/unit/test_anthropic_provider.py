@@ -6,7 +6,7 @@ from typing import Literal
 import pytest
 from pydantic import BaseModel
 
-from packages.ai.provider import AnthropicProvider, StructuredOutputError
+from packages.ai.provider import AnthropicProvider, OpenRouterProvider, StructuredOutputError
 
 
 class Probe(BaseModel):
@@ -30,6 +30,71 @@ class FakeMessages:
 class FakeClient:
     def __init__(self, response: object) -> None:
         self.messages = FakeMessages(response)
+
+
+class RetryMessages:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, object]] = []
+
+    async def create(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return self.responses[len(self.calls) - 1]
+
+
+class RetryClient:
+    def __init__(self, responses: list[object]) -> None:
+        self.messages = RetryMessages(responses)
+
+
+class FakeCompletions:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, object]] = []
+
+    async def create(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        return self.responses[len(self.calls) - 1]
+
+
+class FakeOpenRouterClient:
+    def __init__(self, responses: list[object]) -> None:
+        self.chat = SimpleNamespace(completions=FakeCompletions(responses))
+
+
+@pytest.mark.asyncio
+async def test_openrouter_provider_retries_length_truncation() -> None:
+    client = FakeOpenRouterClient(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"status":'), finish_reason="length"
+                    )
+                ],
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"status":"ok"}'))],
+                finish_reason="stop",
+            ),
+        ]
+    )
+    provider = OpenRouterProvider("test-key", model="router-test", client=client)
+
+    result = await provider.generate(
+        agent_name="watchlist_research",
+        instructions="Return status ok.",
+        input_payload="{}",
+        response_model=Probe,
+    )
+
+    assert result == Probe(status="ok")
+    assert len(client.chat.completions.calls) == 2
+    assert "\nReturn only" in client.chat.completions.calls[1]["messages"][0]["content"]
+    assert (
+        client.chat.completions.calls[1]["max_tokens"]
+        > client.chat.completions.calls[0]["max_tokens"]
+    )
 
 
 @pytest.mark.asyncio
@@ -90,3 +155,55 @@ async def test_anthropic_provider_reports_safe_schema_diagnostics() -> None:
 
     assert error_info.value.diagnostics == [{"loc": "status", "type": "literal_error"}]
     assert error_info.value.stop_reason == "tool_use"
+
+
+async def test_anthropic_provider_retries_truncated_tool_output_without_tool_block() -> None:
+    client = RetryClient(
+        [
+            SimpleNamespace(stop_reason="max_tokens", content=[]),
+            SimpleNamespace(
+                stop_reason="tool_use",
+                content=[SimpleNamespace(type="tool_use", input={"status": "ok"})],
+            ),
+        ]
+    )
+    provider = AnthropicProvider("test-key", model="claude-test", client=client)
+
+    result = await provider.generate(
+        agent_name="watchlist_research",
+        instructions="Return status ok.",
+        input_payload="{}",
+        response_model=Probe,
+    )
+
+    assert result == Probe(status="ok")
+    assert len(client.messages.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_retries_truncated_tool_output_concisely() -> None:
+    client = RetryClient(
+        [
+            SimpleNamespace(
+                stop_reason="max_tokens",
+                content=[SimpleNamespace(type="tool_use", input={"status": "invalid"})],
+            ),
+            SimpleNamespace(
+                stop_reason="tool_use",
+                content=[SimpleNamespace(type="tool_use", input={"status": "ok"})],
+            ),
+        ]
+    )
+    provider = AnthropicProvider("test-key", model="claude-test", client=client)
+
+    result = await provider.generate(
+        agent_name="watchlist_research",
+        instructions="Return status ok.",
+        input_payload="{}",
+        response_model=StrictProbe,
+    )
+
+    assert result == StrictProbe(status="ok")
+    assert len(client.messages.calls) == 2
+    assert client.messages.calls[1]["max_tokens"] > client.messages.calls[0]["max_tokens"]
+    assert "Be concise" in str(client.messages.calls[1]["system"])
