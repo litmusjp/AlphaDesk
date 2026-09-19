@@ -102,6 +102,20 @@ def _maybe_create_order_intent(
     return intent
 
 
+def _scan_disposition(
+    *, mode: ScanMode, create_intent: bool, risk_decision: str, intent: OrderIntent | None
+) -> str:
+    if risk_decision != "APPROVE":
+        return "RISK_REJECTED"
+    if mode is ScanMode.PRE_SCAN and create_intent:
+        return "PRE_SCAN_CANDIDATE"
+    if intent is not None:
+        return "TRADE"
+    if not create_intent:
+        return "RESEARCH_CANDIDATE"
+    return "RISK_REJECTED"
+
+
 class ConnectedOpportunityService:
     """Builds Catalyst opportunities exclusively from live Alpaca responses."""
 
@@ -376,19 +390,15 @@ class ConnectedOpportunityService:
             create_intent=create_intent,
             approved_intent=approved_intent,
         )
-        pre_scan = mode is ScanMode.PRE_SCAN
         result = ConnectedAnalysis(
             opportunity_id=opportunity_id,
             scan_run_id=scan_run_id,
             symbol=normalized,
-            disposition=(
-                ("PRE_SCAN_CANDIDATE" if pre_scan else "TRADE")
-                if intent
-                else (
-                    "RESEARCH_CANDIDATE"
-                    if not create_intent and risk.decision == "APPROVE"
-                    else "RISK_REJECTED"
-                )
+            disposition=_scan_disposition(
+                mode=mode,
+                create_intent=create_intent,
+                risk_decision=risk.decision,
+                intent=intent,
             ),
             observed_at=now,
             expires_at=expires_at,
@@ -398,7 +408,11 @@ class ConnectedOpportunityService:
             risk_decision=risk.model_dump(mode="json"),
             order_intent=None if intent is None else intent.model_dump(mode="json"),
             option_diagnostics=option_diagnostics,
-            reason_codes=("execution_validation_pending",) if pre_scan and intent else (),
+            reason_codes=(
+                ("execution_validation_pending",)
+                if mode is ScanMode.PRE_SCAN and create_intent and risk.decision == "APPROVE"
+                else ()
+            ),
         )
         await self._persist(result)
         return result

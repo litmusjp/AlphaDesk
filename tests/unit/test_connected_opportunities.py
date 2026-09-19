@@ -7,6 +7,7 @@ from alpaca.data.enums import DataFeed
 from packages.connected.opportunities import (
     ConnectedOpportunityService,
     _maybe_create_order_intent,
+    _scan_disposition,
 )
 from packages.connected.option_scan_policy import ScanMode
 
@@ -65,3 +66,51 @@ def test_non_intent_scan_never_creates_order_intent(monkeypatch: pytest.MonkeyPa
     )
 
     assert result is None
+
+
+def test_pre_scan_approved_candidate_is_reviewable_without_intent() -> None:
+    assert (
+        _scan_disposition(
+            mode=ScanMode.PRE_SCAN,
+            create_intent=True,
+            risk_decision="APPROVE",
+            intent=None,
+        )
+        == "PRE_SCAN_CANDIDATE"
+    )
+
+
+def test_pre_scan_without_intent_remains_research_only() -> None:
+    assert (
+        _scan_disposition(
+            mode=ScanMode.PRE_SCAN,
+            create_intent=False,
+            risk_decision="APPROVE",
+            intent=None,
+        )
+        == "RESEARCH_CANDIDATE"
+    )
+
+
+def test_execution_rejection_is_not_promoted_to_candidate() -> None:
+    assert (
+        _scan_disposition(
+            mode=ScanMode.EXECUTION,
+            create_intent=True,
+            risk_decision="REJECT",
+            intent=None,
+        )
+        == "RISK_REJECTED"
+    )
+
+
+def test_rejected_risk_with_intent_remains_rejected() -> None:
+    assert (
+        _scan_disposition(
+            mode=ScanMode.EXECUTION,
+            create_intent=True,
+            risk_decision="REJECT",
+            intent=SimpleNamespace(),
+        )
+        == "RISK_REJECTED"
+    )

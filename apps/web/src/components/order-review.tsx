@@ -9,7 +9,7 @@ type Leg = { side: string; ratio: number; contract?: { symbol?: string; strike?:
 type Structure = { structure_type?: string; max_loss?: string; max_profit?: string; break_evens?: string[]; legs?: Leg[] };
 type Candidate = { structure?: Structure };
 type RiskCheck = { name: string; passed: boolean };
-type RiskDecision = { checks?: RiskCheck[] };
+type RiskDecision = { decision?: string; checks?: RiskCheck[] };
 type OrderIntent = { client_order_id: string; quantity: number; limit_price: string };
 type OptionDiagnostics = { total_contracts: number; requested_type_contracts: number; strict_eligible_contracts: number; selected_contracts: number; rejection_counts: Record<string, number> };
 type Analysis = { opportunity_id: string; symbol: string; disposition: string; source: string; observed_at: string; expires_at: string; signal: Record<string, unknown>; candidate: Candidate | null; risk_decision: RiskDecision | null; order_intent: OrderIntent | null; option_diagnostics: OptionDiagnostics | null; reason_codes: string[] };
@@ -20,6 +20,7 @@ export function OrderReview({ id }: { id: string }) {
   const [approval, setApproval] = useState<ConditionalApproval | null>(null);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [now, setNow] = useState<Date | null>(null);
 
   const refresh = useCallback(async () => {
     const [nextOpportunity, approvals] = await Promise.all([
@@ -37,26 +38,35 @@ export function OrderReview({ id }: { id: string }) {
     return () => clearTimeout(kickoff);
   }, [refresh]);
 
+  useEffect(() => {
+    const kickoff = setTimeout(() => setNow(new Date()), 0);
+    const timer = setInterval(() => setNow(new Date()), 1000);
+    return () => {
+      clearTimeout(kickoff);
+      clearInterval(timer);
+    };
+  }, []);
+
   if (!opportunity) return <section className="loading-panel">{message || "Loading immutable order review…"}</section>;
 
   const structure = opportunity.candidate?.structure;
   const intent = opportunity.order_intent;
   const checks = opportunity.risk_decision?.checks ?? [];
-  const canApprove = opportunity.source === "ALPACA_REAL" && opportunity.disposition === "TRADE" && Boolean(intent) && Boolean(structure);
-  const canRenewApproval = !approval || ["EXPIRED", "CONDITION_FAILED", "REJECTED"].includes(approval.state);
-  const approvalCanReject = approval?.state === "APPROVED_FOR_SESSION";
+  const canApprove = opportunity.source === "ALPACA_REAL" && ["TRADE", "PRE_SCAN_CANDIDATE"].includes(opportunity.disposition) && opportunity.risk_decision?.decision === "APPROVE" && now !== null && new Date(opportunity.expires_at).getTime() > now.getTime() && Boolean(structure);
+  const canRenewApproval = !approval || ["EXPIRED", "CONDITION_FAILED", "REJECTED"].includes(approval.state) || (approval.state === "APPROVED_FOR_SESSION" && now !== null && new Date(approval.expires_at).getTime() <= now.getTime());
+  const approvalCanReject = approval?.state === "APPROVED_FOR_SESSION" && now !== null && new Date(approval.expires_at).getTime() > now.getTime();
 
   async function approveForSession() {
-    if (!intent || !structure) return;
+    if (!structure) return;
     setBusy(true);
     setMessage("");
     try {
       const nextApproval = await deskFetch<ConditionalApproval>(`/desk/opportunities/${id}/approve-session`, {
         method: "POST",
         body: JSON.stringify({
-          max_limit_price: intent.limit_price,
+          max_limit_price: intent?.limit_price,
           max_loss: structure.max_loss,
-          max_quantity: intent.quantity,
+          max_quantity: intent?.quantity,
           max_quote_age_seconds: 30,
         }),
       });

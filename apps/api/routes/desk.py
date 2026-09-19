@@ -61,7 +61,7 @@ from packages.domain.ai import AIWorkflowResult, Citation
 from packages.domain.broker import BrokerAccount, BrokerOrder, BrokerPosition, BrokerSyncStatus
 from packages.domain.guardian import GuardianStatus, GuardianTrigger
 from packages.domain.system import BrokerState
-from packages.domain.workflow import OrderIntent, RankedCandidate
+from packages.domain.workflow import OrderIntent, RankedCandidate, RiskDecision, RiskDecisionValue
 from packages.execution.conditional_approval import (
     ApprovalState,
     ExitOrderSide,
@@ -72,6 +72,7 @@ from packages.execution.conditional_approval import (
 )
 from packages.execution.connected_paper import execute_connected_paper_order
 from packages.execution.engine import SubmissionUncertain
+from packages.execution.intents import create_order_intent
 from packages.guardian.store import PostgresGuardianStore
 from packages.observability.logging import get_logger
 from packages.security.store import CredentialStore
@@ -1414,24 +1415,55 @@ async def approve_for_next_session(
     session_date, expires_at = await _next_session_window(request, context)
     now = datetime.now(UTC)
     async with request.app.state.database.sessions.begin() as session:
-        opportunity_record = await session.scalar(
-            select(ConnectedOpportunityRecord).where(
-                ConnectedOpportunityRecord.workspace_id == context.workspace_id,
-                ConnectedOpportunityRecord.opportunity_id == opportunity_id,
+        opportunity_record, scan_trigger = (
+            await session.execute(
+                select(ConnectedOpportunityRecord, ConnectedScanRunRecord.trigger)
+                .outerjoin(
+                    ConnectedScanRunRecord,
+                    ConnectedScanRunRecord.scan_run_id == ConnectedOpportunityRecord.scan_run_id,
+                )
+                .where(
+                    ConnectedOpportunityRecord.workspace_id == context.workspace_id,
+                    ConnectedOpportunityRecord.opportunity_id == opportunity_id,
+                )
             )
-        )
+        ).one_or_none()
         if opportunity_record is None:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         opportunity = ConnectedAnalysis.model_validate(opportunity_record.payload)
-        if opportunity.source != "ALPACA_REAL" or opportunity.disposition != "TRADE":
+        if opportunity_record.expires_at <= now or opportunity.expires_at <= now:
+            raise HTTPException(
+                status_code=409, detail="Opportunity expired; analyze the symbol again"
+            )
+        if scan_trigger == "AI_RESEARCH":
+            raise HTTPException(status_code=409, detail="Read-only research cannot be approved")
+        if opportunity.source != "ALPACA_REAL" or opportunity.disposition not in {
+            "TRADE",
+            "PRE_SCAN_CANDIDATE",
+        }:
             raise HTTPException(
                 status_code=409,
-                detail="Only execution-mode trade opportunities can be approved",
+                detail="Only execution or pre-scan candidate opportunities can be approved",
             )
-        if opportunity.order_intent is None or opportunity.candidate is None:
-            raise HTTPException(status_code=409, detail="Opportunity has no immutable order intent")
-        intent = OrderIntent.model_validate(opportunity.order_intent)
+        if opportunity.candidate is None:
+            raise HTTPException(status_code=409, detail="Opportunity has no immutable candidate")
         candidate = RankedCandidate.model_validate(opportunity.candidate)
+        if opportunity.risk_decision is None:
+            raise HTTPException(
+                status_code=409, detail="Opportunity has no immutable risk decision"
+            )
+        risk_decision = RiskDecision.model_validate(opportunity.risk_decision)
+        if risk_decision.decision is not RiskDecisionValue.APPROVE:
+            raise HTTPException(status_code=409, detail="Opportunity risk decision is not approved")
+        if opportunity.order_intent is None:
+            try:
+                intent = create_order_intent(risk_decision, candidate)
+            except ValueError as error:
+                raise HTTPException(
+                    status_code=409, detail="Opportunity cannot be approved"
+                ) from error
+        else:
+            intent = OrderIntent.model_validate(opportunity.order_intent)
         broker_account = await session.scalar(
             select(BrokerAccountRecord).where(
                 BrokerAccountRecord.workspace_id == context.workspace_id,
