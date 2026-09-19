@@ -294,8 +294,8 @@ class AnthropicProvider:
                             getattr(block, "input", None),
                             stop_reason=getattr(response, "stop_reason", None),
                         )
-                    except StructuredOutputError as error:
-                        if attempt == 0 and error.stop_reason == "max_tokens":
+                    except StructuredOutputError:
+                        if attempt == 0:
                             break
                         raise
             else:
