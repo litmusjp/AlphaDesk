@@ -71,7 +71,7 @@ class WatchlistResearchReport(BaseModel):
 
     summary: str = Field(min_length=1, max_length=1200)
     limitations: tuple[str, ...] = Field(min_length=1, max_length=8)
-    recommendations: tuple[WatchlistRecommendation, ...] = Field(min_length=1, max_length=20)
+    recommendations: tuple[WatchlistRecommendation, ...] = Field(min_length=1, max_length=10)
     as_of: datetime
 
 
@@ -82,7 +82,7 @@ financial facts, catalysts, or data freshness. Do not use tools. Do not create
 orders, trade intents, approvals, position actions, price targets, or execution
 instructions. This is advisory research only.
 
-Rank only symbols in the supplied universe and return no more than 20 recommendations.
+Rank only symbols in the supplied universe and return no more than 10 recommendations.
 For each ranked symbol, choose KEEP, DROP, or WATCH. KEEP means it merits
 remaining on the user's watchlist; DROP means it is less useful for this watchlist
 based on the evidence; WATCH means evidence is
@@ -169,15 +169,9 @@ async def run_watchlist_research(
 ) -> WatchlistResearchReport:
     universe = tuple(symbol.upper() for symbol in symbols)
     evidence_by_symbol = {
-        str(item["symbol"]).upper(): item
-        for item in evidence
-        if item.get("symbol") is not None
+        str(item["symbol"]).upper(): item for item in evidence if item.get("symbol") is not None
     }
-    allowed_source_ids = frozenset(
-        str(item["source_id"])
-        for item in evidence
-        if item.get("status") == "AVAILABLE"
-    )
+    allowed_source_ids = frozenset(str(item["source_id"]) for item in evidence)
     result = await provider.generate(
         agent_name="watchlist_research",
         instructions=WATCHLIST_RESEARCH_PROMPT,
@@ -198,9 +192,7 @@ async def run_watchlist_research(
     if set(recommendation_ranks) != set(range(1, len(recommendation_ranks) + 1)):
         raise ValueError("watchlist research returned non-contiguous ranks")
     unknown_sources = {
-        citation.source_id
-        for item in result.recommendations
-        for citation in item.citations
+        citation.source_id for item in result.recommendations for citation in item.citations
     } - allowed_source_ids
     if unknown_sources:
         raise ValueError(f"watchlist research cited unknown sources: {sorted(unknown_sources)}")

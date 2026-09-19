@@ -5,7 +5,12 @@ from datetime import UTC, datetime
 import pytest
 
 from packages.ai.provider import FixtureAIProvider
-from packages.ai.watchlist import DISCOVERY_UNIVERSE, _compact_evidence, run_watchlist_research
+from packages.ai.watchlist import (
+    DISCOVERY_UNIVERSE,
+    WatchlistResearchReport,
+    _compact_evidence,
+    run_watchlist_research,
+)
 
 
 def test_discovery_universe_includes_existing_symbols_and_additional_candidates() -> None:
@@ -14,6 +19,10 @@ def test_discovery_universe_includes_existing_symbols_and_additional_candidates(
     )
     assert len(DISCOVERY_UNIVERSE) >= 20
     assert "PLTR" in DISCOVERY_UNIVERSE
+    assert (
+        WatchlistResearchReport.model_json_schema()["properties"]["recommendations"]["maxItems"]
+        == 10
+    )
 
 
 def test_watchlist_research_compacts_option_evidence_without_losing_contract_identity() -> None:
@@ -217,3 +226,43 @@ async def test_watchlist_research_rejects_unsupported_execution_eligibility() ->
                 },
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_watchlist_research_allows_citations_for_unavailable_symbols() -> None:
+    provider = FixtureAIProvider(
+        {
+            "watchlist_research": {
+                "summary": "The symbol needs more data.",
+                "limitations": ["The real-data scan was unavailable."],
+                "recommendations": [
+                    {
+                        "symbol": "AAPL",
+                        "action": "WATCH",
+                        "rank": 1,
+                        "rationale": "Keep under observation until data is available.",
+                        "option_assessment": "INSUFFICIENT_DATA",
+                        "option_reason": "No current deterministic scan evidence.",
+                        "risks": ["Evidence unavailable."],
+                        "confidence": "0.2",
+                        "citations": [{"source_id": "scan-AAPL", "claim": "Scan unavailable."}],
+                    }
+                ],
+                "as_of": datetime.now(UTC).isoformat(),
+            }
+        }
+    )
+
+    result = await run_watchlist_research(
+        provider,
+        symbols=("AAPL",),
+        evidence=(
+            {
+                "source_id": "scan-AAPL",
+                "symbol": "AAPL",
+                "status": "UNAVAILABLE_FROM_DISCOVERY_SCAN",
+            },
+        ),
+    )
+
+    assert result.recommendations[0].option_assessment == "INSUFFICIENT_DATA"

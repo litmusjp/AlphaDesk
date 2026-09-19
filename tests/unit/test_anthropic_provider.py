@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 from pydantic import BaseModel
 
-from packages.ai.provider import AnthropicProvider
+from packages.ai.provider import AnthropicProvider, StructuredOutputError
 
 
 class Probe(BaseModel):
     status: str
+
+
+class StrictProbe(BaseModel):
+    status: Literal["ok"]
 
 
 class FakeMessages:
@@ -30,9 +35,7 @@ class FakeClient:
 @pytest.mark.asyncio
 async def test_anthropic_provider_parses_schema_constrained_tool_output() -> None:
     client = FakeClient(
-        SimpleNamespace(
-            content=[SimpleNamespace(type="tool_use", input={"status": "ok"})]
-        )
+        SimpleNamespace(content=[SimpleNamespace(type="tool_use", input={"status": "ok"})])
     )
     provider = AnthropicProvider("test-key", model="claude-test", client=client)
 
@@ -65,3 +68,25 @@ async def test_anthropic_provider_rejects_missing_tool_output() -> None:
             input_payload="{}",
             response_model=Probe,
         )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_reports_safe_schema_diagnostics() -> None:
+    client = FakeClient(
+        SimpleNamespace(
+            stop_reason="tool_use",
+            content=[SimpleNamespace(type="tool_use", input={"status": "invalid"})],
+        )
+    )
+    provider = AnthropicProvider("test-key", model="claude-test", client=client)
+
+    with pytest.raises(StructuredOutputError) as error_info:
+        await provider.generate(
+            agent_name="probe",
+            instructions="Return status ok.",
+            input_payload="{}",
+            response_model=StrictProbe,
+        )
+
+    assert error_info.value.diagnostics == [{"loc": "status", "type": "literal_error"}]
+    assert error_info.value.stop_reason == "tool_use"

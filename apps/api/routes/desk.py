@@ -18,7 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
-from packages.ai.provider import AIProvider, AnthropicProvider, OpenRouterProvider
+from packages.ai.provider import (
+    AIProvider,
+    AnthropicProvider,
+    OpenRouterProvider,
+    StructuredOutputError,
+)
 from packages.ai.store import AIWorkflowStore
 from packages.ai.watchlist import (
     DISCOVERY_UNIVERSE,
@@ -143,7 +148,7 @@ class WatchlistInput(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     symbols: tuple[str, ...] = Field(max_length=MAX_WATCHLIST_SYMBOLS)
-    source: Literal["operator", "ai_research"] = "operator"
+    source: Literal["operator", "ai_research", "default_restore"] = "operator"
 
 
 class WatchlistRemovalInput(BaseModel):
@@ -1212,6 +1217,39 @@ async def research_watchlist(
             detail=(
                 "Watchlist AI research timed out; the market scan completed "
                 "but no recommendations were returned"
+            ),
+        ) from error
+    except StructuredOutputError as error:
+        failure_reason = "AI_SCHEMA_INVALID"
+        await _save_watchlist_ai_run(
+            request,
+            context,
+            provider=provider_name,
+            model=model,
+            input_payload=input_payload,
+            output_payload={
+                "degraded": True,
+                "failure_reason": failure_reason,
+                "diagnostics": error.diagnostics,
+            },
+            degraded=True,
+            failure_reason=failure_reason,
+        )
+        logger.warning(
+            "watchlist_research_schema_invalid",
+            extra={
+                "event": "watchlist_research_schema_invalid",
+                "workspace_id": str(context.workspace_id),
+                "provider": provider_name,
+                "diagnostics": error.diagnostics,
+                "stop_reason": error.stop_reason,
+            },
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Watchlist research provider returned an invalid structured response; "
+                "no watchlist changes were made. Retry the research request."
             ),
         ) from error
     except Exception as error:

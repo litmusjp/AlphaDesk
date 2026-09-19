@@ -6,13 +6,50 @@ from typing import Any, Protocol, TypeVar, cast
 
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
 
 
 class StructuredOutputError(ValueError):
     """The provider returned content that was not a schema-valid JSON document."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: list[dict[str, str]] | None = None,
+        stop_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or []
+        self.stop_reason = stop_reason
+
+
+def _validation_diagnostics(error: ValidationError) -> list[dict[str, str]]:
+    return [
+        {
+            "loc": ".".join(str(part) for part in detail["loc"]) or "<root>",
+            "type": str(detail["type"]),
+        }
+        for detail in error.errors()
+    ]
+
+
+def _validate_structured_output(  # noqa: UP047
+    response_model: type[ResponseT],
+    value: object,
+    *,
+    stop_reason: str | None = None,
+) -> ResponseT:
+    try:
+        return response_model.model_validate(value)
+    except ValidationError as error:
+        raise StructuredOutputError(
+            "Provider returned schema-invalid structured output",
+            diagnostics=_validation_diagnostics(error),
+            stop_reason=stop_reason,
+        ) from error
 
 
 def _decode_structured_content(content: str) -> object:
@@ -176,7 +213,7 @@ class OpenRouterProvider:
         content = response.choices[0].message.content
         if not content:
             raise ValueError(f"{agent_name} returned no structured output")
-        return response_model.model_validate(_decode_structured_content(content))
+        return _validate_structured_output(response_model, _decode_structured_content(content))
 
 
 class AnthropicProvider:
@@ -212,7 +249,7 @@ class AnthropicProvider:
         response = await asyncio.wait_for(
             self._client.messages.create(
                 model=self.model,
-                max_tokens=2000,
+                max_tokens=5000,
                 system=instructions,
                 messages=[{"role": "user", "content": input_payload}],
                 tools=[
@@ -228,5 +265,9 @@ class AnthropicProvider:
         )
         for block in response.content:
             if getattr(block, "type", None) == "tool_use":
-                return response_model.model_validate(getattr(block, "input", None))
+                return _validate_structured_output(
+                    response_model,
+                    getattr(block, "input", None),
+                    stop_reason=getattr(response, "stop_reason", None),
+                )
         raise ValueError(f"{agent_name} returned no structured output")
