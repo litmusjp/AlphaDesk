@@ -41,7 +41,7 @@ export function MarketScanner() {
   const [runs, setRuns] = useState<ScanRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [clock, setClock] = useState<MarketClock | null>(null);
-  const [now, setNow] = useState(() => new Date());
+  const [now, setNow] = useState<Date | null>(null);
   const [busy, setBusy] = useState(false);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [watchlistBusy, setWatchlistBusy] = useState(false);
@@ -283,7 +283,7 @@ export function MarketScanner() {
   const selectedRun = runs.find((run) => run.scan_run_id === selectedRunId) ?? null;
   const latestSelected = Boolean(selectedRun && runs[0]?.scan_run_id === selectedRun.scan_run_id);
   const nextEvent = clock ? (clock.is_open ? clock.next_close : clock.next_open) : null;
-  const countdown = formatCountdown(nextEvent, now);
+  const countdown = now ? formatCountdown(nextEvent, now) : null;
   const dispositionCounts = results.reduce<Record<string, number>>((counts, result) => {
     counts[result.disposition] = (counts[result.disposition] ?? 0) + 1;
     return counts;
@@ -304,7 +304,7 @@ export function MarketScanner() {
         </div>
       </div>
       <div><small>REGULAR SESSION</small><strong>{clock?.regular_session ?? "9:30 AM-4:00 PM ET"}</strong></div>
-      <div><small>EASTERN TIME</small><strong>{easternTime.format(now)}</strong></div>
+      <div><small>EASTERN TIME</small><strong>{now ? easternTime.format(now) : "—"}</strong></div>
       <div className="market-clock-guidance">{clock?.is_open ? <Clock3/> : <AlertTriangle/>}<span><strong>{clock?.is_open ? "Freshness checks active" : "After-hours notice"}</strong><small>{clock?.is_open ? `Next close ${nextEvent ? easternDateTime.format(new Date(nextEvent)) : ""}` : `Option quotes may be stale. Next open ${nextEvent ? easternDateTime.format(new Date(nextEvent)) : ""}.`}</small></span></div>
     </section>
 
