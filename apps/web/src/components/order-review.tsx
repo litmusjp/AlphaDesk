@@ -6,7 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 import { deskFetch } from "@/lib/api";
 
 type Leg = { side: string; ratio: number; contract?: { symbol?: string; strike?: string; option_type?: string } };
-type Structure = { structure_type?: string; max_loss?: string; max_profit?: string; break_evens?: string[]; legs?: Leg[] };
+type Structure = { structure_type?: string; quantity?: number; net_premium_per_share?: string; max_loss?: string; max_profit?: string; break_evens?: string[]; legs?: Leg[] };
 type Candidate = { structure?: Structure };
 type RiskCheck = { name: string; passed: boolean };
 type RiskDecision = { decision?: string; checks?: RiskCheck[] };
@@ -52,21 +52,23 @@ export function OrderReview({ id }: { id: string }) {
   const structure = opportunity.candidate?.structure;
   const intent = opportunity.order_intent;
   const checks = opportunity.risk_decision?.checks ?? [];
-  const canApprove = opportunity.source === "ALPACA_REAL" && ["TRADE", "PRE_SCAN_CANDIDATE"].includes(opportunity.disposition) && opportunity.risk_decision?.decision === "APPROVE" && now !== null && new Date(opportunity.expires_at).getTime() > now.getTime() && Boolean(structure);
+  const recommendedQuantity = intent?.quantity ?? structure?.quantity;
+  const recommendedLimit = intent?.limit_price ?? structure?.net_premium_per_share;
+  const canApprove = opportunity.source === "ALPACA_REAL" && ["TRADE", "PRE_SCAN_CANDIDATE"].includes(opportunity.disposition) && opportunity.risk_decision?.decision === "APPROVE" && now !== null && new Date(opportunity.expires_at).getTime() > now.getTime() && Boolean(structure) && recommendedQuantity !== undefined && recommendedLimit !== undefined;
   const canRenewApproval = !approval || ["EXPIRED", "CONDITION_FAILED", "REJECTED"].includes(approval.state) || (approval.state === "APPROVED_FOR_SESSION" && now !== null && new Date(approval.expires_at).getTime() <= now.getTime());
   const approvalCanReject = approval?.state === "APPROVED_FOR_SESSION" && now !== null && new Date(approval.expires_at).getTime() > now.getTime();
 
   async function approveForSession() {
-    if (!structure) return;
+    if (!structure || recommendedQuantity === undefined || recommendedLimit === undefined) return;
     setBusy(true);
     setMessage("");
     try {
       const nextApproval = await deskFetch<ConditionalApproval>(`/desk/opportunities/${id}/approve-session`, {
         method: "POST",
         body: JSON.stringify({
-          max_limit_price: intent?.limit_price,
+          max_limit_price: recommendedLimit,
           max_loss: structure.max_loss,
-          max_quantity: intent?.quantity,
+          max_quantity: recommendedQuantity,
           max_quote_age_seconds: 30,
         }),
       });
@@ -101,7 +103,7 @@ export function OrderReview({ id }: { id: string }) {
     <div className="review-grid">
       <section className="control-panel">
         <div className="panel-title"><div><small>IMMUTABLE ORDER REVIEW</small><h2>{opportunity.symbol} · {String(structure?.structure_type ?? "No structure").replaceAll("_", " ")}</h2></div><span className="status-pill good">{opportunity.source}</span></div>
-        <div className="review-stats"><div><small>Quantity</small><strong>{intent?.quantity ?? "—"}</strong></div><div><small>Limit</small><strong>${intent?.limit_price ?? "—"}</strong></div><div><small>Maximum loss</small><strong>${structure?.max_loss ?? "—"}</strong></div><div><small>Maximum profit</small><strong>${structure?.max_profit ?? "—"}</strong></div><div><small>Break-even</small><strong>{structure?.break_evens?.join(", ") ?? "—"}</strong></div><div><small>Quote expiry</small><strong>{new Date(opportunity.expires_at).toLocaleTimeString()}</strong></div></div>
+        <div className="review-stats"><div><small>Recommended quantity</small><strong>{recommendedQuantity ?? "—"}</strong></div><div><small>Recommended limit</small><strong>${recommendedLimit ?? "—"}</strong></div><div><small>Maximum loss</small><strong>${structure?.max_loss ?? "—"}</strong></div><div><small>Maximum profit</small><strong>${structure?.max_profit ?? "—"}</strong></div><div><small>Break-even</small><strong>{structure?.break_evens?.join(", ") ?? "—"}</strong></div><div><small>Quote expiry</small><strong>{new Date(opportunity.expires_at).toLocaleTimeString()}</strong></div></div>
         <div className="review-stats"><div><small>Signal score</small><strong>{String(opportunity.signal.score ?? "—")} / 100</strong></div><div><small>Disposition</small><strong>{opportunity.disposition.replaceAll("_", " ")}</strong></div></div>
         <h3>Decision reasons</h3><p>{opportunity.reason_codes.join(", ") || "All deterministic gates passed."}</p>
         {opportunity.option_diagnostics ? <><h3>Option-chain diagnostics</h3><p>{opportunity.option_diagnostics.selected_contracts} reviewable of {opportunity.option_diagnostics.requested_type_contracts} requested-side contracts; {opportunity.option_diagnostics.strict_eligible_contracts} pass current-session execution filters.</p><p>{Object.entries(opportunity.option_diagnostics.rejection_counts).map(([reason, count]) => `${reason.replaceAll("_", " ")}: ${count}`).join(" · ") || "No execution-filter rejections."}</p></> : null}
